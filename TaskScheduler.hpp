@@ -63,7 +63,7 @@ namespace Apostol {
             void Authentication();
             void Authorize(CStringList &SQL, const CString &Username);
 
-            static void RunAction(CStringList &SQL, const CString &MsgId, const CString &Action);
+            static void ExecuteObjectAction(CStringList &SQL, const CString &MsgId, const CString &Action);
             static void SetArea(CStringList &SQL, const CString &Area);
             static void SetObjectLabel(CStringList &SQL, const CString &MsgId, const CString &Label);
 

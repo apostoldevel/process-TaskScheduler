@@ -202,8 +202,8 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::RunAction(CStringList &SQL, const CString &Id, const CString &Action) {
-            SQL.Add(CString().Format("SELECT * FROM api.run_action(%s, %s);",
+        void CTaskScheduler::ExecuteObjectAction(CStringList &SQL, const CString &Id, const CString &Action) {
+            SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s, %s);",
                                      Id.c_str(),
                                      PQQuoteLiteral(Action).c_str()
             ));
@@ -344,7 +344,7 @@ namespace Apostol {
             CStringList SQL;
 
             Authorize(SQL, API_BOT_USERNAME);
-            RunAction(SQL, Id, "execute");
+            ExecuteObjectAction(SQL, Id, "execute");
 
             Log()->Message("[%s] Task executed.", Id.c_str());
 
@@ -360,7 +360,7 @@ namespace Apostol {
             CStringList SQL;
 
             Authorize(SQL, API_BOT_USERNAME);
-            RunAction(SQL, Id, "done");
+            ExecuteObjectAction(SQL, Id, "done");
 
             Log()->Message("[%s] Task completed.", Id.c_str());
 
@@ -376,7 +376,7 @@ namespace Apostol {
             CStringList SQL;
 
             Authorize(SQL, API_BOT_USERNAME);
-            RunAction(SQL, Id, "fail");
+            ExecuteObjectAction(SQL, Id, "fail");
             SetObjectLabel(SQL, Id, Error);
 
             Log()->Message("[%s] Task failed.", Id.c_str());
@@ -393,7 +393,7 @@ namespace Apostol {
             CStringList SQL;
 
             Authorize(SQL, API_BOT_USERNAME);
-            RunAction(SQL, Id, "abort");
+            ExecuteObjectAction(SQL, Id, "abort");
 
             Log()->Message("[%s] Task aborted.", Id.c_str());
 
