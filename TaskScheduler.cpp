@@ -91,7 +91,7 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         bool CTaskScheduler::InProgress(const CString &Id) {
-            return m_Jobs.IndexOfName(Id) != -1;
+            return m_Jobs.IndexOf(Id) != -1;
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -240,26 +240,38 @@ namespace Apostol {
 
                 CPQueryResults Result;
                 CStringList SQL;
+                CString Error;
+
+                int Index;
 
                 try {
                     CApostolModule::QueryToResults(APollQuery, Result);
 
                     const auto &Jobs = Result[QUERY_INDEX_JOB];
-                    for (int Row = 0; Row < Jobs.Count(); Row++) {
+                    for (int Row = 0; Row < Jobs.Count(); ++Row) {
 
                         const auto &Job = Jobs[Row];
 
                         const auto &Id = Job.Values("id");
                         const auto &StateCode = Job.Values("statecode");
 
-                        if (StateCode == "enabled")
-                            DoStart(Id);
-
-                        if (InProgress(Id))
+                        Index = m_Jobs.IndexOf(Id);
+                        if (Index != -1) {
+                            if (StateCode == "canceled") {
+                                auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(Index));
+                                if (pQuery->CancelQuery(Error))
+                                    DoAbort(Id);
+                                else
+                                    DoFail(Id, Error);
+                            }
                             continue;
+                        }
 
-                        if (StateCode == "executed")
+                        if (StateCode == "executed") {
                             DoAbort(Id);
+                        } else {
+                            DoStart(Id);
+                        }
                     }
 
                 } catch (Delphi::Exception::Exception &E) {
@@ -333,25 +345,25 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults Result;
-                CStringList SQL;
-
+                CPQResult *pResult;
                 try {
-                    CApostolModule::QueryToResults(APollQuery, Result);
+                    for (int I = 0; I < APollQuery->Count(); I++) {
+                        pResult = APollQuery->Results(I);
 
-                    const auto &Jobs = Result[QUERY_INDEX_JOB];
-                    for (int Row = 0; Row < Jobs.Count(); Row++) {
+                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
+                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
 
-                        const auto &Job = Jobs[Row];
-
-                        const auto &Id = Job.Values("id");
-                        const auto &StateCode = Job.Values("statecode");
-
-                        if (InProgress(Id))
+                        if (I <= QUERY_INDEX_SU)
                             continue;
 
-                    }
+                        const CJSON Json(pResult->GetValue(0, 0));
 
+                        const auto &Id = Json["object"].AsString();
+
+                        const auto Index = m_Jobs.IndexOf(Id);
+                        if (Index != -1)
+                            m_Jobs.Delete(Index);
+                    }
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -366,8 +378,10 @@ namespace Apostol {
             Authorize(SQL, API_BOT_USERNAME);
             ExecuteObjectAction(SQL, Id, "execute");
 
+            Log()->Message("[%s] Task started.", Id.c_str());
+
             try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                m_Jobs.AddObject(Id, (CPQQuery *) ExecSQL(SQL, nullptr, OnExecuted, OnException));
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
             }
