@@ -55,6 +55,8 @@ namespace Apostol {
             CDateTime m_AuthDate;
             CDateTime m_CheckDate;
 
+            CStringList m_Jobs;
+
             void CheckTask();
 
             void BeforeRun() override;
@@ -74,8 +76,7 @@ namespace Apostol {
             void DoHeartbeat();
             void DoError(const Delphi::Exception::Exception &E);
 
-            void DoExecute(const CString &Id);
-            void DoDone(const CString &Id);
+            void DoStart(const CString &Id);
 
             void DoAbort(const CString &Id);
             void DoFail(const CString &Id, const CString &Error);
@@ -95,10 +96,10 @@ namespace Apostol {
                 return new CTaskScheduler(AParent, AApplication);
             }
 
+            bool InProgress(const CString &Id);
+
             void Run() override;
             void Reload() override;
-
-            CPQPollQuery *GetQuery(CPollConnection *AConnection) override;
 
         };
         //--------------------------------------------------------------------------------------------------------------

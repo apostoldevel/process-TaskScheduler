@@ -30,6 +30,10 @@ Author:
 
 #define API_BOT_USERNAME "apibot"
 
+#define QUERY_INDEX_AUTH    0
+#define QUERY_INDEX_SU      1
+#define QUERY_INDEX_JOB     2
+
 extern "C++" {
 
 namespace Apostol {
@@ -43,7 +47,7 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         CTaskScheduler::CTaskScheduler(CCustomProcess *AParent, CApplication *AApplication):
-                inherited(AParent, AApplication, "task scheduler") {
+                inherited(AParent, AApplication, "job scheduler") {
 
             m_Agent = "Task Scheduler";
             m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
@@ -60,7 +64,7 @@ namespace Apostol {
         void CTaskScheduler::BeforeRun() {
             sigset_t set;
 
-            Application()->Header(Application()->Name() + ": task scheduler");
+            Application()->Header(Application()->Name() + ": job scheduler");
 
             Log()->Debug(0, MSG_PROCESS_START, GetProcessName(), Application()->Header().c_str());
 
@@ -86,10 +90,15 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
+        bool CTaskScheduler::InProgress(const CString &Id) {
+            return m_Jobs.IndexOfName(Id) != -1;
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
         void CTaskScheduler::Run() {
             while (!sig_exiting) {
 
-                log_debug0(APP_LOG_DEBUG_EVENT, Log(), 0, "task scheduler cycle");
+                log_debug0(APP_LOG_DEBUG_EVENT, Log(), 0, "job scheduler cycle");
 
                 try
                 {
@@ -104,7 +113,7 @@ namespace Apostol {
                     if (sig_quit) {
                         sig_quit = 0;
                         Log()->Error(APP_LOG_NOTICE, 0, "gracefully shutting down");
-                        Application()->Header("task scheduler is shutting down");
+                        Application()->Header("job scheduler is shutting down");
                     }
 
                     //DoExit();
@@ -127,7 +136,7 @@ namespace Apostol {
                 }
             }
 
-            Log()->Error(APP_LOG_NOTICE, 0, "stop task scheduler");
+            Log()->Error(APP_LOG_NOTICE, 0, "stop job scheduler");
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -235,34 +244,22 @@ namespace Apostol {
                 try {
                     CApostolModule::QueryToResults(APollQuery, Result);
 
-                    const auto &enabled = Result[2]; // enabled -> execute
-                    for (int Row = 0; Row < enabled.Count(); Row++) {
-                        const auto &Record = enabled[Row];
-                        DoExecute(Record["id"]);
-                    }
+                    const auto &Jobs = Result[QUERY_INDEX_JOB];
+                    for (int Row = 0; Row < Jobs.Count(); Row++) {
 
-                    const auto &canceled = Result[3]; // canceled -> abort
-                    for (int Row = 0; Row < canceled.Count(); Row++) {
-                        const auto &Record = canceled[Row];
-                        DoAbort(Record["id"]);
-                    }
+                        const auto &Job = Jobs[Row];
 
-                    const auto &completed = Result[4]; // completed -> execute
-                    for (int Row = 0; Row < completed.Count(); Row++) {
-                        const auto &Record = completed[Row];
-                        DoExecute(Record["id"]);
-                    }
+                        const auto &Id = Job.Values("id");
+                        const auto &StateCode = Job.Values("statecode");
 
-                    const auto &failed = Result[5]; // failed -> execute
-                    for (int Row = 0; Row < failed.Count(); Row++) {
-                        const auto &Record = failed[Row];
-                        DoExecute(Record["id"]);
-                    }
+                        if (StateCode == "enabled")
+                            DoStart(Id);
 
-                    const auto &aborted = Result[6]; // aborted -> execute
-                    for (int Row = 0; Row < aborted.Count(); Row++) {
-                        const auto &Record = aborted[Row];
-                        DoExecute(Record["id"]);
+                        if (InProgress(Id))
+                            continue;
+
+                        if (StateCode == "executed")
+                            DoAbort(Id);
                     }
 
                 } catch (Delphi::Exception::Exception &E) {
@@ -274,19 +271,11 @@ namespace Apostol {
                 DoError(E);
             };
 
-            struct timeval now = {0, 0};
-
-            gettimeofday(&now, nullptr);
-
             CStringList SQL;
 
             Authorize(SQL, API_BOT_USERNAME);
 
-            SQL.Add(CString().Format("SELECT * FROM api.task('enabled', %d) ORDER BY created LIMIT 5;", now.tv_sec));
-            SQL.Add(CString().Format("SELECT * FROM api.task('canceled', %d) ORDER BY created LIMIT 5;", now.tv_sec));
-            SQL.Add(CString().Format("SELECT * FROM api.task('completed', %d) ORDER BY created LIMIT 5;", now.tv_sec));
-            SQL.Add(CString().Format("SELECT * FROM api.task('failed', %d) ORDER BY created LIMIT 5;", now.tv_sec));
-            SQL.Add(CString().Format("SELECT * FROM api.task('aborted', %d) ORDER BY created LIMIT 5;", now.tv_sec));
+            SQL.Add(CString().Format("SELECT * FROM api.job('enabled') ORDER BY created;"));
 
             try {
                 ExecSQL(SQL, nullptr, OnExecuted, OnException);
@@ -340,32 +329,45 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoExecute(const CString &Id) {
+        void CTaskScheduler::DoStart(const CString &Id) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+
+                CPQueryResults Result;
+                CStringList SQL;
+
+                try {
+                    CApostolModule::QueryToResults(APollQuery, Result);
+
+                    const auto &Jobs = Result[QUERY_INDEX_JOB];
+                    for (int Row = 0; Row < Jobs.Count(); Row++) {
+
+                        const auto &Job = Jobs[Row];
+
+                        const auto &Id = Job.Values("id");
+                        const auto &StateCode = Job.Values("statecode");
+
+                        if (InProgress(Id))
+                            continue;
+
+                    }
+
+                } catch (Delphi::Exception::Exception &E) {
+                    DoError(E);
+                }
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                DoError(E);
+            };
+
             CStringList SQL;
 
             Authorize(SQL, API_BOT_USERNAME);
             ExecuteObjectAction(SQL, Id, "execute");
 
-            Log()->Message("[%s] Task executed.", Id.c_str());
-
             try {
-                ExecSQL(SQL);
-            } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoDone(const CString &Id) {
-            CStringList SQL;
-
-            Authorize(SQL, API_BOT_USERNAME);
-            ExecuteObjectAction(SQL, Id, "done");
-
-            Log()->Message("[%s] Task completed.", Id.c_str());
-
-            try {
-                ExecSQL(SQL);
+                ExecSQL(SQL, nullptr, OnExecuted, OnException);
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
             }
@@ -405,23 +407,6 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        CPQPollQuery *CTaskScheduler::GetQuery(CPollConnection *AConnection) {
-            auto pQuery = CServerProcess::GetQuery(AConnection);
-
-            if (Assigned(pQuery)) {
-#if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
-                pQuery->OnPollExecuted([this](auto && APollQuery) { DoPostgresQueryExecuted(APollQuery); });
-                pQuery->OnException([this](auto && APollQuery, auto && AException) { DoPostgresQueryException(APollQuery, AException); });
-#else
-                pQuery->OnPollExecuted(std::bind(&CTaskScheduler::DoPostgresQueryExecuted, this, _1));
-                pQuery->OnException(std::bind(&CTaskScheduler::DoPostgresQueryException, this, _1, _2));
-#endif
-            }
-
-            return pQuery;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
         bool CTaskScheduler::DoExecute(CTCPConnection *AConnection) {
             return true;
         }
@@ -437,13 +422,13 @@ namespace Apostol {
                         throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
                 }
             } catch (Delphi::Exception::Exception &E) {
-                Log()->Error(APP_LOG_EMERG, 0, E.what());
+                DoError(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-            Log()->Error(APP_LOG_EMERG, 0, E.what());
+            DoError(E);
         }
         //--------------------------------------------------------------------------------------------------------------
     }
