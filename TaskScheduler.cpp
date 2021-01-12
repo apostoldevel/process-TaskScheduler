@@ -106,7 +106,7 @@ namespace Apostol {
                 }
                 catch (Delphi::Exception::Exception &E)
                 {
-                    Log()->Error(APP_LOG_EMERG, 0, E.what());
+                    Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
                 }
 
                 if (sig_terminate || sig_quit) {
@@ -307,7 +307,7 @@ namespace Apostol {
             m_AuthDate = now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
             m_CheckDate = now + (CDateTime) m_HeartbeatInterval * 2 / MSecsPerDay;
 
-            Log()->Error(APP_LOG_EMERG, 0, E.what());
+            Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
         }
         //--------------------------------------------------------------------------------------------------------------
 
