@@ -213,7 +213,7 @@ namespace Apostol {
 
         void CTaskScheduler::ExecuteObjectAction(CStringList &SQL, const CString &Id, const CString &Action) {
             SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s, %s);",
-                                     Id.c_str(),
+                                     PQQuoteLiteral(Id).c_str(),
                                      PQQuoteLiteral(Action).c_str()
             ));
         }
@@ -228,7 +228,7 @@ namespace Apostol {
 
         void CTaskScheduler::SetObjectLabel(CStringList &SQL, const CString &Id, const CString &Label) {
             SQL.Add(CString().Format("SELECT * FROM api.set_object_label(%s, %s);",
-                                     Id.c_str(),
+                                     PQQuoteLiteral(Id).c_str(),
                                      PQQuoteLiteral(Label).c_str()
             ));
         }
