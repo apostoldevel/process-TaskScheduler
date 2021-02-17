@@ -212,7 +212,7 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::ExecuteObjectAction(CStringList &SQL, const CString &Id, const CString &Action) {
-            SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s::uuid, %s::uuid);",
+            SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s::uuid, %s);",
                                      PQQuoteLiteral(Id).c_str(),
                                      PQQuoteLiteral(Action).c_str()
             ));
