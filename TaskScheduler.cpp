@@ -212,7 +212,7 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::ExecuteObjectAction(CStringList &SQL, const CString &Id, const CString &Action) {
-            SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s, %s);",
+            SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s::uuid, %s::uuid);",
                                      PQQuoteLiteral(Id).c_str(),
                                      PQQuoteLiteral(Action).c_str()
             ));
@@ -220,14 +220,14 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::SetArea(CStringList &SQL, const CString &Area) {
-            SQL.Add(CString().Format("SELECT * FROM api.set_session_area(%s);",
+            SQL.Add(CString().Format("SELECT * FROM api.set_session_area(%s::uuid);",
                                      PQQuoteLiteral(Area).c_str()
             ));
         }
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::SetObjectLabel(CStringList &SQL, const CString &Id, const CString &Label) {
-            SQL.Add(CString().Format("SELECT * FROM api.set_object_label(%s, %s);",
+            SQL.Add(CString().Format("SELECT * FROM api.set_object_label(%s::uuid, %s);",
                                      PQQuoteLiteral(Id).c_str(),
                                      PQQuoteLiteral(Label).c_str()
             ));
