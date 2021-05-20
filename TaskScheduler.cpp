@@ -154,12 +154,12 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults Result;
+                CPQueryResults pqResults;
                 CStringList SQL;
 
                 try {
-                    CApostolModule::QueryToResults(APollQuery, Result);
-                    const auto &login = Result[0][0];
+                    CApostolModule::QueryToResults(APollQuery, pqResults);
+                    const auto &login = pqResults[0][0];
 
                     m_Session = login["session"];
                     m_Secret = login["secret"];
@@ -238,16 +238,16 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults Result;
+                CPQueryResults pqResults;
                 CStringList SQL;
                 CString Error;
 
                 int Index;
 
                 try {
-                    CApostolModule::QueryToResults(APollQuery, Result);
+                    CApostolModule::QueryToResults(APollQuery, pqResults);
 
-                    const auto &Jobs = Result[QUERY_INDEX_JOB];
+                    const auto &Jobs = pqResults[QUERY_INDEX_JOB];
                     for (int Row = 0; Row < Jobs.Count(); ++Row) {
 
                         const auto &Job = Jobs[Row];
