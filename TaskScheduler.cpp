@@ -25,14 +25,12 @@ Author:
 #include "TaskScheduler.hpp"
 //----------------------------------------------------------------------------------------------------------------------
 
-#define PROVIDER_APPLICATION_NAME "service"
+#define SERVICE_APPLICATION_NAME "service"
 #define CONFIG_SECTION_NAME "process/TaskScheduler"
 
 #define API_BOT_USERNAME "apibot"
 
-#define QUERY_INDEX_AUTH    0
-#define QUERY_INDEX_SU      1
-#define QUERY_INDEX_JOB     2
+#define QUERY_INDEX_DATA     1
 
 extern "C++" {
 
@@ -52,12 +50,11 @@ namespace Apostol {
             m_Agent = "Task Scheduler";
             m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
 
-            const auto now = Now();
-
-            m_AuthDate = now;
-            m_CheckDate = now;
+            m_AuthDate = 0;
+            m_CheckDate = 0;
 
             m_HeartbeatInterval = 5000;
+            m_Status = psStopped;
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -143,10 +140,10 @@ namespace Apostol {
         void CTaskScheduler::Reload() {
             CServerProcess::Reload();
 
-            const auto now = Now();
+            m_AuthDate = 0;
+            m_CheckDate = 0;
 
-            m_AuthDate = now;
-            m_CheckDate = now;
+            m_Jobs.Clear();
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -159,12 +156,15 @@ namespace Apostol {
 
                 try {
                     CApostolModule::QueryToResults(APollQuery, pqResults);
-                    const auto &login = pqResults[0][0];
 
-                    m_Session = login["session"];
-                    m_Secret = login["secret"];
+                    m_Session = pqResults[0][0]["session"];
+                    m_Secret = pqResults[0][0]["secret"];
+
+                    m_ApiBot = pqResults[1][0]["get_session"];
 
                     m_AuthDate = Now() + (CDateTime) 24 / HoursPerDay;
+
+                    m_Status = psRunning;
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -174,7 +174,7 @@ namespace Apostol {
                 DoError(E);
             };
 
-            CString Application(PROVIDER_APPLICATION_NAME);
+            CString Application(SERVICE_APPLICATION_NAME);
 
             const auto &Providers = Server().Providers();
             const auto &Provider = Providers.DefaultValue();
@@ -184,53 +184,14 @@ namespace Apostol {
 
             CStringList SQL;
 
-            SQL.Add(CString().Format("SELECT * FROM api.login(%s, %s, %s, %s);",
-                                     PQQuoteLiteral(m_ClientId).c_str(),
-                                     PQQuoteLiteral(m_ClientSecret).c_str(),
-                                     PQQuoteLiteral(m_Agent).c_str(),
-                                     PQQuoteLiteral(m_Host).c_str()
-            ));
+            api::login(SQL, m_ClientId, m_ClientSecret, m_Agent, m_Host);
+            api::get_session(SQL, API_BOT_USERNAME, m_Agent, m_Host);
 
             try {
                 ExecSQL(SQL, nullptr, OnExecuted, OnException);
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
             }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::Authorize(CStringList &SQL, const CString &Username) {
-            SQL.Add(CString().Format("SELECT * FROM api.authorize(%s);",
-                                     PQQuoteLiteral(m_Session).c_str()
-            ));
-
-            SQL.Add(CString().Format("SELECT * FROM api.su(%s, %s);",
-                                     PQQuoteLiteral(Username).c_str(),
-                                     PQQuoteLiteral(m_ClientSecret).c_str()
-            ));
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::ExecuteObjectAction(CStringList &SQL, const CString &Id, const CString &Action) {
-            SQL.Add(CString().Format("SELECT * FROM api.execute_object_action(%s::uuid, %s);",
-                                     PQQuoteLiteral(Id).c_str(),
-                                     PQQuoteLiteral(Action).c_str()
-            ));
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::SetArea(CStringList &SQL, const CString &Area) {
-            SQL.Add(CString().Format("SELECT * FROM api.set_session_area(%s::uuid);",
-                                     PQQuoteLiteral(Area).c_str()
-            ));
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::SetObjectLabel(CStringList &SQL, const CString &Id, const CString &Label) {
-            SQL.Add(CString().Format("SELECT * FROM api.set_object_label(%s::uuid, %s);",
-                                     PQQuoteLiteral(Id).c_str(),
-                                     PQQuoteLiteral(Label).c_str()
-            ));
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -242,38 +203,42 @@ namespace Apostol {
                 CStringList SQL;
                 CString Error;
 
-                int Index;
+                int index;
 
                 try {
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
-                    const auto &Jobs = pqResults[QUERY_INDEX_JOB];
-                    for (int Row = 0; Row < Jobs.Count(); ++Row) {
+                    const auto &jobs = pqResults[QUERY_INDEX_DATA];
+                    for (int row = 0; row < jobs.Count(); ++row) {
 
-                        const auto &Job = Jobs[Row];
+                        const auto &job = jobs[row];
 
-                        const auto &Id = Job.Values("id");
-                        const auto &StateCode = Job.Values("statecode");
+                        const auto &id = job["id"];
+                        const auto &state_code = job["statecode"];
 
-                        Index = m_Jobs.IndexOf(Id);
-                        if (Index != -1) {
-                            if (StateCode == "canceled") {
-                                auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(Index));
+                        index = m_Jobs.IndexOf(id);
+                        if (index != -1) {
+                            if (state_code == "canceled") {
+                                auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
                                 if (pQuery->CancelQuery(Error))
-                                    DoAbort(Id);
+                                    DoAbort(id);
                                 else
-                                    DoFail(Id, Error);
+                                    DoFail(id, Error);
                             }
-                            continue;
+
+                            if (state_code == "executed")
+                              continue;
+
+                            if (state_code == "enabled")
+                                m_Jobs.Delete(index);
                         }
 
-                        if (StateCode == "executed") {
-                            DoAbort(Id);
-                        } else {
-                            DoStart(Id);
+                        if (state_code == "executed") {
+                            DoAbort(id);
+                        } else if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
+                            DoStart(id);
                         }
                     }
-
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -285,7 +250,7 @@ namespace Apostol {
 
             CStringList SQL;
 
-            Authorize(SQL, API_BOT_USERNAME);
+            api::authorize(SQL, m_ApiBot);
 
             SQL.Add(CString().Format("SELECT * FROM api.job('enabled') ORDER BY created;"));
 
@@ -345,25 +310,17 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQResult *pResult;
+                CPQueryResults pqResults;
                 try {
-                    for (int I = 0; I < APollQuery->Count(); I++) {
-                        pResult = APollQuery->Results(I);
+                    CApostolModule::QueryToResults(APollQuery, pqResults);
 
-                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                    const CJSON Json(pqResults[QUERY_INDEX_DATA][0]["execute_object_action"]);
 
-                        if (I <= QUERY_INDEX_SU)
-                            continue;
+                    const auto &object = Json["object"].AsString();
 
-                        const CJSON Json(pResult->GetValue(0, 0));
-
-                        const auto &Id = Json["object"].AsString();
-
-                        const auto Index = m_Jobs.IndexOf(Id);
-                        if (Index != -1)
-                            m_Jobs.Delete(Index);
-                    }
+                    const auto index = m_Jobs.IndexOf(object);
+                    if (index != -1)
+                        m_Jobs.Delete(index);
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -375,8 +332,8 @@ namespace Apostol {
 
             CStringList SQL;
 
-            Authorize(SQL, API_BOT_USERNAME);
-            ExecuteObjectAction(SQL, Id, "execute");
+            api::authorize(SQL, m_ApiBot);
+            api::execute_object_action(SQL, Id, "execute");
 
             Log()->Message("[%s] Task started.", Id.c_str());
 
@@ -391,9 +348,9 @@ namespace Apostol {
         void CTaskScheduler::DoFail(const CString &Id, const CString &Error) {
             CStringList SQL;
 
-            Authorize(SQL, API_BOT_USERNAME);
-            ExecuteObjectAction(SQL, Id, "fail");
-            SetObjectLabel(SQL, Id, Error);
+            api::authorize(SQL, m_ApiBot);
+            api::execute_object_action(SQL, Id, "fail");
+            api::set_object_label(SQL, Id, Error);
 
             Log()->Message("[%s] Task failed.", Id.c_str());
 
@@ -408,8 +365,8 @@ namespace Apostol {
         void CTaskScheduler::DoAbort(const CString &Id) {
             CStringList SQL;
 
-            Authorize(SQL, API_BOT_USERNAME);
-            ExecuteObjectAction(SQL, Id, "abort");
+            api::authorize(SQL, m_ApiBot);
+            api::execute_object_action(SQL, Id, "abort");
 
             Log()->Message("[%s] Task aborted.", Id.c_str());
 

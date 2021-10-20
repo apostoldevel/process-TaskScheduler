@@ -41,6 +41,7 @@ namespace Apostol {
             typedef CProcessCustom inherited;
 
         private:
+            CProcessStatus m_Status;
 
             CString m_Token;
             CString m_Session;
@@ -49,6 +50,7 @@ namespace Apostol {
             CString m_ClientSecret;
             CString m_Agent;
             CString m_Host;
+            CString m_ApiBot;
 
             int m_HeartbeatInterval;
 
@@ -63,11 +65,6 @@ namespace Apostol {
             void AfterRun() override;
 
             void Authentication();
-            void Authorize(CStringList &SQL, const CString &Username);
-
-            static void ExecuteObjectAction(CStringList &SQL, const CString &MsgId, const CString &Action);
-            static void SetArea(CStringList &SQL, const CString &Area);
-            static void SetObjectLabel(CStringList &SQL, const CString &MsgId, const CString &Label);
 
         protected:
 
