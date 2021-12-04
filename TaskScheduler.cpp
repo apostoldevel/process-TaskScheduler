@@ -30,7 +30,10 @@ Author:
 
 #define API_BOT_USERNAME "apibot"
 
+#define QUERY_INDEX_AUTH     0
 #define QUERY_INDEX_DATA     1
+
+#define SLEEP_SECOND_AFTER_ERROR 10
 
 extern "C++" {
 
@@ -53,7 +56,7 @@ namespace Apostol {
             m_AuthDate = 0;
             m_CheckDate = 0;
 
-            m_HeartbeatInterval = 5000;
+            m_HeartbeatInterval = 1000;
             m_Status = psStopped;
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -97,12 +100,9 @@ namespace Apostol {
 
                 Log()->Debug(APP_LOG_DEBUG_EVENT, _T("job scheduler cycle"));
 
-                try
-                {
+                try {
                     PQServer().Wait();
-                }
-                catch (Delphi::Exception::Exception &E)
-                {
+                } catch (Delphi::Exception::Exception &E) {
                     Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
                 }
 
@@ -112,8 +112,6 @@ namespace Apostol {
                         Log()->Debug(APP_LOG_DEBUG_EVENT, _T("gracefully shutting down"));
                         Application()->Header(_T("job scheduler is shutting down"));
                     }
-
-                    //DoExit();
 
                     if (!sig_exiting) {
                         sig_exiting = 1;
@@ -140,10 +138,17 @@ namespace Apostol {
         void CTaskScheduler::Reload() {
             CServerProcess::Reload();
 
+            m_Session.Clear();
+            m_Secret.Clear();
+            m_Sessions.Clear();
+            m_Jobs.Clear();
+
             m_AuthDate = 0;
             m_CheckDate = 0;
 
-            m_Jobs.Clear();
+            m_Status = psStopped;
+
+            Log()->Notice("[%s] Successful reloading", CONFIG_SECTION_NAME);
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -152,15 +157,27 @@ namespace Apostol {
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
                 CPQueryResults pqResults;
+
                 CStringList SQL;
 
                 try {
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
-                    m_Session = pqResults[0][0]["session"];
-                    m_Secret = pqResults[0][0]["secret"];
+                    const auto &login = pqResults[0];
+                    const auto &sessions = pqResults[1];
 
-                    m_ApiBot = pqResults[1][0]["get_session"];
+                    const CString oldSession(m_Session);
+
+                    m_Session = login.First()["session"];
+                    m_Secret = login.First()["secret"];
+
+                    for (int i = 0; i < sessions.Count(); ++i) {
+                        m_Sessions.Add(sessions[i]["get_sessions"]);
+                    }
+
+                    if (!oldSession.IsEmpty()) {
+                        SignOut(oldSession);
+                    }
 
                     m_AuthDate = Now() + (CDateTime) 24 / HoursPerDay;
 
@@ -185,10 +202,23 @@ namespace Apostol {
             CStringList SQL;
 
             api::login(SQL, m_ClientId, m_ClientSecret, m_Agent, m_Host);
-            api::get_session(SQL, API_BOT_USERNAME, m_Agent, m_Host);
+            api::get_sessions(SQL, API_BOT_USERNAME, m_Agent, m_Host);
 
             try {
                 ExecSQL(SQL, nullptr, OnExecuted, OnException);
+            } catch (Delphi::Exception::Exception &E) {
+                DoError(E);
+            }
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::SignOut(const CString &Session) {
+            CStringList SQL;
+
+            api::signout(SQL, Session);
+
+            try {
+                ExecSQL(SQL);
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
             }
@@ -205,8 +235,15 @@ namespace Apostol {
 
                 int index;
 
+                const auto &session = APollQuery->Data()["session"];
+
                 try {
                     CApostolModule::QueryToResults(APollQuery, pqResults);
+
+                    const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
+
+                    if (authorize["authorized"] != "t")
+                        throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
 
                     const auto &jobs = pqResults[QUERY_INDEX_DATA];
                     for (int row = 0; row < jobs.Count(); ++row) {
@@ -221,9 +258,9 @@ namespace Apostol {
                             if (state_code == "canceled") {
                                 auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
                                 if (pQuery->CancelQuery(Error))
-                                    DoAbort(id);
+                                    DoAbort(session, id);
                                 else
-                                    DoFail(id, Error);
+                                    DoFail(session, id, Error);
                             }
 
                             if (state_code == "executed")
@@ -234,9 +271,9 @@ namespace Apostol {
                         }
 
                         if (state_code == "executed") {
-                            DoAbort(id);
+                            DoAbort(session, id);
                         } else if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
-                            DoStart(id);
+                            DoStart(session, id);
                         }
                     }
                 } catch (Delphi::Exception::Exception &E) {
@@ -248,31 +285,36 @@ namespace Apostol {
                 DoError(E);
             };
 
-            CStringList SQL;
+            for (int i = 0; i < m_Sessions.Count(); ++i) {
+                const auto &session = m_Sessions[i];
 
-            api::authorize(SQL, m_ApiBot);
+                CStringList SQL;
 
-            SQL.Add(CString().Format("SELECT * FROM api.job('enabled') ORDER BY created;"));
+                api::authorize(SQL, session);
+                api::job(SQL, "enabled");
 
-            try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException);
-            } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
+                try {
+                    auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                    pQuery->Data().AddPair("session", session);
+                } catch (Delphi::Exception::Exception &E) {
+                    DoError(E);
+                }
             }
         }
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoError(const Delphi::Exception::Exception &E) {
-            const auto now = Now();
-
-            m_Token.Clear();
             m_Session.Clear();
             m_Secret.Clear();
+            m_Sessions.Clear();
 
-            m_AuthDate = now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
-            m_CheckDate = now + (CDateTime) m_HeartbeatInterval * 2 / MSecsPerDay;
+            m_AuthDate = Now() + (CDateTime) SLEEP_SECOND_AFTER_ERROR / SecsPerDay; // 10 sec;
+            m_CheckDate = m_AuthDate;
+
+            m_Status = psStopped;
 
             Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
+            Log()->Notice("Continue after %d seconds", SLEEP_SECOND_AFTER_ERROR);
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -280,13 +322,16 @@ namespace Apostol {
             const auto now = Now();
 
             if ((now >= m_AuthDate)) {
+                m_AuthDate = now + (CDateTime) 5 / SecsPerDay; // 5 sec
                 Authentication();
             }
 
-            if ((now >= m_CheckDate)) {
-                m_CheckDate = now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
-                if (!m_Session.IsEmpty()) {
-                    CheckTask();
+            if (m_Status == psRunning) {
+                if ((now >= m_CheckDate)) {
+                    m_CheckDate = now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
+                    if (!m_Session.IsEmpty()) {
+                        CheckTask();
+                    }
                 }
             }
         }
@@ -306,7 +351,7 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoStart(const CString &Id) {
+        void CTaskScheduler::DoStart(const CString &Session, const CString &Id) {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
@@ -332,7 +377,7 @@ namespace Apostol {
 
             CStringList SQL;
 
-            api::authorize(SQL, m_ApiBot);
+            api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "execute");
 
             Log()->Message("[%s] Task started.", Id.c_str());
@@ -345,10 +390,10 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoFail(const CString &Id, const CString &Error) {
+        void CTaskScheduler::DoFail(const CString &Session, const CString &Id, const CString &Error) {
             CStringList SQL;
 
-            api::authorize(SQL, m_ApiBot);
+            api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "fail");
             api::set_object_label(SQL, Id, Error);
 
@@ -362,10 +407,10 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoAbort(const CString &Id) {
+        void CTaskScheduler::DoAbort(const CString &Session, const CString &Id) {
             CStringList SQL;
 
-            api::authorize(SQL, m_ApiBot);
+            api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "abort");
 
             Log()->Message("[%s] Task aborted.", Id.c_str());

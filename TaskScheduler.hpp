@@ -43,28 +43,29 @@ namespace Apostol {
         private:
             CProcessStatus m_Status;
 
-            CString m_Token;
             CString m_Session;
             CString m_Secret;
             CString m_ClientId;
             CString m_ClientSecret;
             CString m_Agent;
             CString m_Host;
-            CString m_ApiBot;
 
-            int m_HeartbeatInterval;
+            CStringList m_Sessions;
 
             CDateTime m_AuthDate;
             CDateTime m_CheckDate;
 
             CStringList m_Jobs;
 
-            void CheckTask();
+            int m_HeartbeatInterval;
 
             void BeforeRun() override;
             void AfterRun() override;
 
             void Authentication();
+            void SignOut(const CString &Session);
+
+            void CheckTask();
 
         protected:
 
@@ -73,10 +74,9 @@ namespace Apostol {
             void DoHeartbeat();
             void DoError(const Delphi::Exception::Exception &E);
 
-            void DoStart(const CString &Id);
-
-            void DoAbort(const CString &Id);
-            void DoFail(const CString &Id, const CString &Error);
+            void DoStart(const CString &Session, const CString &Id);
+            void DoAbort(const CString &Session, const CString &Id);
+            void DoFail(const CString &Session, const CString &Id, const CString &Error);
 
             bool DoExecute(CTCPConnection *AConnection) override;
 
