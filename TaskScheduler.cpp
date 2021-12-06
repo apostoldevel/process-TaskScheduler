@@ -447,6 +447,18 @@ namespace Apostol {
             DoError(E);
         }
         //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoPQServerException(CPQServer *AServer, const Delphi::Exception::Exception &E) {
+            CServerProcess::DoPQServerException(AServer, E);
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoPQConnectException(CPQConnection *AConnection, const Delphi::Exception::Exception &E) {
+            CServerProcess::DoPQConnectException(AConnection, E);
+            if (m_Status == psRunning) {
+                DoError(E);
+            }
+        }
     }
 }
 
