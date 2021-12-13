@@ -50,7 +50,7 @@ namespace Apostol {
         CTaskScheduler::CTaskScheduler(CCustomProcess *AParent, CApplication *AApplication):
                 inherited(AParent, AApplication, "job scheduler") {
 
-            m_Agent = "Task Scheduler";
+            m_Agent = CString().Format("%s (Task Scheduler)", Application()->Title().c_str());
             m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
 
             m_AuthDate = 0;
@@ -171,6 +171,7 @@ namespace Apostol {
                     m_Session = login.First()["session"];
                     m_Secret = login.First()["secret"];
 
+                    m_Sessions.Clear();
                     for (int i = 0; i < sessions.Count(); ++i) {
                         m_Sessions.Add(sessions[i]["get_sessions"]);
                     }
@@ -191,13 +192,11 @@ namespace Apostol {
                 DoError(E);
             };
 
-            CString Application(SERVICE_APPLICATION_NAME);
+            const auto &caProviders = Server().Providers();
+            const auto &caProvider = caProviders.DefaultValue();
 
-            const auto &Providers = Server().Providers();
-            const auto &Provider = Providers.DefaultValue();
-
-            m_ClientId = Provider.ClientId(Application);
-            m_ClientSecret = Provider.Secret(Application);
+            m_ClientId = caProvider.ClientId(SERVICE_APPLICATION_NAME);
+            m_ClientSecret = caProvider.Secret(SERVICE_APPLICATION_NAME);
 
             CStringList SQL;
 
@@ -306,7 +305,6 @@ namespace Apostol {
         void CTaskScheduler::DoError(const Delphi::Exception::Exception &E) {
             m_Session.Clear();
             m_Secret.Clear();
-            m_Sessions.Clear();
 
             m_AuthDate = Now() + (CDateTime) SLEEP_SECOND_AFTER_ERROR / SecsPerDay; // 10 sec;
             m_CheckDate = m_AuthDate;
