@@ -50,7 +50,7 @@ namespace Apostol {
         CTaskScheduler::CTaskScheduler(CCustomProcess *AParent, CApplication *AApplication):
                 inherited(AParent, AApplication, "job scheduler") {
 
-            m_Agent = CString().Format("%s (Task Scheduler)", Application()->Title().c_str());
+            m_Agent = CString().Format("Task Scheduler (%s)", Application()->Title().c_str());
             m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
 
             m_AuthDate = 0;
