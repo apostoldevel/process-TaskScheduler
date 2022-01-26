@@ -48,9 +48,9 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         CTaskScheduler::CTaskScheduler(CCustomProcess *AParent, CApplication *AApplication):
-                inherited(AParent, AApplication, "job scheduler") {
+                inherited(AParent, AApplication, "task scheduler") {
 
-            m_Agent = CString().Format("Task Scheduler (%s)", Application()->Title().c_str());
+            m_Agent = CString().Format("%s (Task Scheduler)", Application()->Title().c_str());
             m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
 
             m_AuthDate = 0;
@@ -64,7 +64,7 @@ namespace Apostol {
         void CTaskScheduler::BeforeRun() {
             sigset_t set;
 
-            Application()->Header(Application()->Name() + ": job scheduler");
+            Application()->Header(Application()->Name() + ": task scheduler");
 
             Log()->Debug(APP_LOG_DEBUG_CORE, MSG_PROCESS_START, GetProcessName(), Application()->Header().c_str());
 
@@ -98,7 +98,7 @@ namespace Apostol {
         void CTaskScheduler::Run() {
             while (!sig_exiting) {
 
-                Log()->Debug(APP_LOG_DEBUG_EVENT, _T("job scheduler cycle"));
+                Log()->Debug(APP_LOG_DEBUG_EVENT, _T("task scheduler cycle"));
 
                 try {
                     PQServer().Wait();
@@ -110,7 +110,7 @@ namespace Apostol {
                     if (sig_quit) {
                         sig_quit = 0;
                         Log()->Debug(APP_LOG_DEBUG_EVENT, _T("gracefully shutting down"));
-                        Application()->Header(_T("job scheduler is shutting down"));
+                        Application()->Header(_T("task scheduler is shutting down"));
                     }
 
                     if (!sig_exiting) {
@@ -131,7 +131,7 @@ namespace Apostol {
                 }
             }
 
-            Log()->Debug(APP_LOG_DEBUG_EVENT, _T("stop job scheduler"));
+            Log()->Debug(APP_LOG_DEBUG_EVENT, _T("stop task scheduler"));
         }
         //--------------------------------------------------------------------------------------------------------------
 
