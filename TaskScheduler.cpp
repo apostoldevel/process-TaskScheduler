@@ -74,9 +74,9 @@ namespace Apostol {
 
             SetUser(Config()->User(), Config()->Group());
 
-            InitializePQServer(Application()->Title());
+            InitializePQClient(Application()->Title());
 
-            PQServerStart("helper");
+            PQClientStart("helper");
 
             SigProcMask(SIG_UNBLOCK, SigAddSet(&set));
 
@@ -86,7 +86,7 @@ namespace Apostol {
 
         void CTaskScheduler::AfterRun() {
             CApplicationProcess::AfterRun();
-            PQServerStop();
+            PQClientStop();
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -101,7 +101,7 @@ namespace Apostol {
                 Log()->Debug(APP_LOG_DEBUG_EVENT, _T("task scheduler cycle"));
 
                 try {
-                    PQServer().Wait();
+                    PQClient().Wait();
                 } catch (Delphi::Exception::Exception &E) {
                     Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
                 }
@@ -446,8 +446,8 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoPQServerException(CPQServer *AServer, const Delphi::Exception::Exception &E) {
-            CServerProcess::DoPQServerException(AServer, E);
+        void CTaskScheduler::DoPQClientException(CPQClient *AClient, const Delphi::Exception::Exception &E) {
+            CServerProcess::DoPQClientException(AClient, E);
         }
         //--------------------------------------------------------------------------------------------------------------
 

@@ -83,7 +83,7 @@ namespace Apostol {
             void DoPostgresQueryExecuted(CPQPollQuery *APollQuery);
             void DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E);
 
-            void DoPQServerException(CPQServer *AServer, const Delphi::Exception::Exception &E) override;
+            void DoPQClientException(CPQClient *AClient, const Delphi::Exception::Exception &E) override;
             void DoPQConnectException(CPQConnection *AConnection, const Delphi::Exception::Exception &E) override;
 
         public:
