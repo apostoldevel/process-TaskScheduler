@@ -74,7 +74,7 @@ namespace Apostol {
 
             SetUser(Config()->User(), Config()->Group());
 
-            InitializePQClient(Application()->Title());
+            InitializePQClient(Application()->Title(), 1, Config()->PostgresPollMin());
 
             PQClientStart("helper");
 
