@@ -316,17 +316,15 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoHeartbeat() {
-            const auto now = Now();
-
-            if ((now >= m_AuthDate)) {
-                m_AuthDate = now + (CDateTime) 5 / SecsPerDay; // 5 sec
+        void CTaskScheduler::Heartbeat(CDateTime Now) {
+            if ((Now >= m_AuthDate)) {
+                m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
                 Authentication();
             }
 
             if (m_Status == psRunning) {
-                if ((now >= m_CheckDate)) {
-                    m_CheckDate = now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
+                if ((Now >= m_CheckDate)) {
+                    m_CheckDate = Now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
                     if (!m_Session.IsEmpty()) {
                         CheckTask();
                     }
@@ -342,7 +340,7 @@ namespace Apostol {
             pTimer->Read(&exp, sizeof(uint64_t));
 
             try {
-                DoHeartbeat();
+                Heartbeat(AHandler->TimeStamp());
             } catch (Delphi::Exception::Exception &E) {
                 DoServerEventHandlerException(AHandler, E);
             }

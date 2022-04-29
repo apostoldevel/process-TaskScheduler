@@ -67,11 +67,12 @@ namespace Apostol {
 
             void CheckTask();
 
+            void Heartbeat(CDateTime Now);
+
         protected:
 
             void DoTimer(CPollEventHandler *AHandler) override;
 
-            void DoHeartbeat();
             void DoError(const Delphi::Exception::Exception &E);
 
             void DoStart(const CString &Session, const CString &Id);
