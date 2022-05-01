@@ -224,15 +224,48 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::CheckTask() {
+        void CTaskScheduler::CheckJobs(const CString &Session, const CPQueryResult &Jobs) {
+            int index;
+            CString Error;
+
+            for (int row = 0; row < Jobs.Count(); ++row) {
+                const auto &job = Jobs[row];
+
+                const auto &id = job["id"];
+                const auto &state_code = job["statecode"];
+
+                index = m_Jobs.IndexOf(id);
+                if (index != -1) {
+                    if (state_code == "canceled") {
+                        auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
+                        if (pQuery->CancelQuery(Error))
+                            DoAbort(Session, id);
+                        else
+                            DoFail(Session, id, Error);
+                    }
+
+                    if (state_code == "executed")
+                        continue;
+
+                    if (state_code == "enabled")
+                        m_Jobs.Delete(index);
+                }
+
+                if (state_code == "executed") {
+                    DoAbort(Session, id);
+                } else if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
+                    DoStart(Session, id);
+                }
+            }
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::CheckTasks() {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
                 CPQueryResults pqResults;
                 CStringList SQL;
-                CString Error;
-
-                int index;
 
                 const auto &session = APollQuery->Data()["session"];
 
@@ -244,37 +277,7 @@ namespace Apostol {
                     if (authorize["authorized"] != "t")
                         throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
 
-                    const auto &jobs = pqResults[QUERY_INDEX_DATA];
-                    for (int row = 0; row < jobs.Count(); ++row) {
-
-                        const auto &job = jobs[row];
-
-                        const auto &id = job["id"];
-                        const auto &state_code = job["statecode"];
-
-                        index = m_Jobs.IndexOf(id);
-                        if (index != -1) {
-                            if (state_code == "canceled") {
-                                auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
-                                if (pQuery->CancelQuery(Error))
-                                    DoAbort(session, id);
-                                else
-                                    DoFail(session, id, Error);
-                            }
-
-                            if (state_code == "executed")
-                              continue;
-
-                            if (state_code == "enabled")
-                                m_Jobs.Delete(index);
-                        }
-
-                        if (state_code == "executed") {
-                            DoAbort(session, id);
-                        } else if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
-                            DoStart(session, id);
-                        }
-                    }
+                    CheckJobs(session, pqResults[QUERY_INDEX_DATA]);
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -326,7 +329,7 @@ namespace Apostol {
                 if ((Now >= m_CheckDate)) {
                     m_CheckDate = Now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
                     if (!m_Session.IsEmpty()) {
-                        CheckTask();
+                        CheckTasks();
                     }
                 }
             }

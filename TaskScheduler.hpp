@@ -65,7 +65,8 @@ namespace Apostol {
             void Authentication();
             void SignOut(const CString &Session);
 
-            void CheckTask();
+            void CheckJobs(const CString &Session, const CPQueryResult &Jobs);
+            void CheckTasks();
 
             void Heartbeat(CDateTime Now);
 
