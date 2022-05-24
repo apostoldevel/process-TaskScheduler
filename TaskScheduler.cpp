@@ -74,9 +74,7 @@ namespace Apostol {
 
             SetUser(Config()->User(), Config()->Group());
 
-            InitializePQClient(Application()->Title(), 1, Config()->PostgresPollMin());
-
-            PQClientStart("helper");
+            InitializePQClients(Application()->Title(), 1, Config()->PostgresPollMin());
 
             SigProcMask(SIG_UNBLOCK, SigAddSet(&set));
 
@@ -86,7 +84,7 @@ namespace Apostol {
 
         void CTaskScheduler::AfterRun() {
             CApplicationProcess::AfterRun();
-            PQClientStop();
+            PQClientsStop();
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -96,12 +94,14 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::Run() {
+            auto &PQClient = PQClientStart("helper");
+
             while (!sig_exiting) {
 
                 Log()->Debug(APP_LOG_DEBUG_EVENT, _T("task scheduler cycle"));
 
                 try {
-                    PQClient().Wait();
+                    PQClient.Wait();
                 } catch (Delphi::Exception::Exception &E) {
                     Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
                 }
