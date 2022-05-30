@@ -43,14 +43,10 @@ namespace Apostol {
         private:
             CProcessStatus m_Status;
 
-            CString m_Session;
-            CString m_Secret;
-            CString m_ClientId;
-            CString m_ClientSecret;
+            CStringList m_Sessions;
+
             CString m_Agent;
             CString m_Host;
-
-            CStringList m_Sessions;
 
             CDateTime m_AuthDate;
             CDateTime m_CheckDate;
