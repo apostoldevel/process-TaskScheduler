@@ -351,7 +351,7 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoRun(const CString &Session, int Index, const CString &Id, const CString &TypeCode, const CString &Body) {
+        void CTaskScheduler::DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body) {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
@@ -395,11 +395,13 @@ namespace Apostol {
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
 
-                pQuery->Data().Values("session", Session);
-                pQuery->Data().Values("id", Id);
-                pQuery->Data().Values("type_code", TypeCode);
+                pQuery->Data().AddPair("session", Session);
+                pQuery->Data().AddPair("id", Id);
+                pQuery->Data().AddPair("type_code", TypeCode);
 
-                m_Jobs.Objects(Index, (CPQQuery *) pQuery);
+                const auto index = m_Jobs.IndexOf(Id);
+                if (index != -1)
+                    m_Jobs.Objects(index, (CPQQuery *) pQuery);
             } catch (Delphi::Exception::Exception &E) {
                 DeleteJob(Id);
                 DoFatal(E);
@@ -425,7 +427,7 @@ namespace Apostol {
                             throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
                     }
 
-                    DoRun(session, m_Jobs.Add(id), id, type_code, body);
+                    DoRun(session, id, type_code, body);
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -433,6 +435,7 @@ namespace Apostol {
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
                 const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
                 DoFatal(E);
             };
 
@@ -444,10 +447,12 @@ namespace Apostol {
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
 
-                pQuery->Data().Values("session", Session);
-                pQuery->Data().Values("id", Id);
-                pQuery->Data().Values("type_code", TypeCode);
-                pQuery->Data().Values("body", Body);
+                pQuery->Data().AddPair("session", Session);
+                pQuery->Data().AddPair("id", Id);
+                pQuery->Data().AddPair("type_code", TypeCode);
+                pQuery->Data().AddPair("body", Body);
+
+                m_Jobs.Add(Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -476,7 +481,7 @@ namespace Apostol {
 
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().Values("id", Id);
+                pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -504,7 +509,7 @@ namespace Apostol {
 
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().Values("id", Id);
+                pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -532,7 +537,7 @@ namespace Apostol {
 
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().Values("id", Id);
+                pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -560,7 +565,7 @@ namespace Apostol {
 
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().Values("id", Id);
+                pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -588,7 +593,7 @@ namespace Apostol {
 
             try {
                 auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().Values("id", Id);
+                pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
