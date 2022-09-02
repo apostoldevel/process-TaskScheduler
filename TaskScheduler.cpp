@@ -233,22 +233,21 @@ namespace Apostol {
                     if (state_code == "canceled") {
                         auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
                         if (pQuery != nullptr) {
-                            if (pQuery->CancelQuery(Error))
+                            if (pQuery->CancelQuery(Error)) {
                                 DoAbort(Session, id);
-                            else
+                            } else {
                                 DoFail(Session, id, Error);
+                            }
                         }
                     }
-                }
-
-                if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
-                    if (index != -1)
-                        m_Jobs.Delete(index);
-                    DoStart(Session, id, type_code, body);
-                } else if (state_code == "executed" && index == -1) {
-                    DoCancel(Session, id);
-                } else if (state_code == "canceled" && index == -1) {
-                    DoAbort(Session, id);
+                } else {
+                    if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
+                        DoStart(Session, id, type_code, body);
+                    } else if (state_code == "executed") {
+                        DoCancel(Session, id);
+                    } else if (state_code == "canceled") {
+                        DoAbort(Session, id);
+                    }
                 }
             }
         }
