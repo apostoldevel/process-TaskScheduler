@@ -176,12 +176,12 @@ namespace Apostol {
 
                     SignOut(session);
                 } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
+                    DoFatal(E);
                 }
             };
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoError(E);
+                DoFatal(E);
             };
 
             const auto &caProviders = Server().Providers();
@@ -198,7 +198,7 @@ namespace Apostol {
             try {
                 ExecSQL(SQL, nullptr, OnExecuted, OnException);
             } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
+                DoFatal(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -211,7 +211,7 @@ namespace Apostol {
             try {
                 ExecSQL(SQL);
             } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
+                DoFatal(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -224,7 +224,9 @@ namespace Apostol {
                 const auto &job = Jobs[row];
 
                 const auto &id = job["id"];
+                const auto &type_code = job["typecode"];
                 const auto &state_code = job["statecode"];
+                const auto &body = job["body"];
 
                 index = m_Jobs.IndexOf(id);
                 if (index != -1) {
@@ -236,17 +238,16 @@ namespace Apostol {
                             DoFail(Session, id, Error);
                     }
 
-                    if (state_code == "executed")
-                        continue;
-
                     if (state_code == "enabled")
                         m_Jobs.Delete(index);
                 }
 
-                if (state_code == "executed") {
+                if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
+                    DoStart(Session, id, type_code, body);
+                } else if (state_code == "executed" && index == -1) {
+                    DoCancel(Session, id);
+                } else if (state_code == "canceled" && index == -1) {
                     DoAbort(Session, id);
-                } else if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
-                    DoStart(Session, id);
                 }
             }
         }
@@ -276,7 +277,7 @@ namespace Apostol {
             };
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoError(E);
+                DoFatal(E);
             };
 
             for (int i = 0; i < m_Sessions.Count(); ++i) {
@@ -291,13 +292,13 @@ namespace Apostol {
                     auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                     pQuery->Data().AddPair("session", session);
                 } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
+                    DoFatal(E);
                 }
             }
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoError(const Delphi::Exception::Exception &E) {
+        void CTaskScheduler::DoFatal(const Delphi::Exception::Exception &E) {
             m_AuthDate = Now() + (CDateTime) SLEEP_SECOND_AFTER_ERROR / SecsPerDay; // 10 sec;
             m_CheckDate = m_AuthDate;
 
@@ -305,6 +306,11 @@ namespace Apostol {
 
             Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
             Log()->Notice("Continue after %d seconds", SLEEP_SECOND_AFTER_ERROR);
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoError(const Delphi::Exception::Exception &E) {
+            Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -337,28 +343,98 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoStart(const CString &Session, const CString &Id) {
+        void CTaskScheduler::DeleteJob(const CString &Id) {
+            const auto index = m_Jobs.IndexOf(Id);
+            if (index != -1)
+                m_Jobs.Delete(index);
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body) {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults pqResults;
+                const auto &session = APollQuery->Data()["session"];
+                const auto &id = APollQuery->Data()["id"];
+                const auto &type_code = APollQuery->Data()["type_code"];
+
+                CPQResult *pResult;
                 try {
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
+                    for (int i = 0; i < APollQuery->Count(); i++) {
+                        pResult = APollQuery->Results(i);
 
-                    const CJSON Json(pqResults[QUERY_INDEX_DATA][0]["execute_object_action"]);
+                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
+                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                    }
 
-                    const auto &object = Json["object"].AsString();
-
-                    const auto index = m_Jobs.IndexOf(object);
-                    if (index != -1)
-                        m_Jobs.Delete(index);
+                    if (type_code == "periodic.job") {
+                        DoDone(session, id);
+                    } else {
+                        DoComplete(session, id);
+                    }
                 } catch (Delphi::Exception::Exception &E) {
+                    DeleteJob(id);
                     DoError(E);
                 }
             };
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoError(E);
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoFatal(E);
+            };
+
+            CStringList SQL;
+
+            api::authorize(SQL, Session);
+            SQL.Add(Body);
+
+            Log()->Message("[%s] Task started.", Id.c_str());
+
+            try {
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+
+                pQuery->Data().Values("session", Session);
+                pQuery->Data().Values("id", Id);
+                pQuery->Data().Values("type_code", TypeCode);
+
+                m_Jobs.AddObject(Id, (CPQQuery *) pQuery);
+            } catch (Delphi::Exception::Exception &E) {
+                DeleteJob(Id);
+                DoFatal(E);
+            }
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoStart(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+
+                const auto &session = APollQuery->Data()["session"];
+                const auto &id = APollQuery->Data()["id"];
+                const auto &type_code = APollQuery->Data()["type_code"];
+                const auto &body = APollQuery->Data()["body"];
+
+                CPQResult *pResult;
+                try {
+                    for (int i = 0; i < APollQuery->Count(); i++) {
+                        pResult = APollQuery->Results(i);
+
+                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
+                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                    }
+
+                    DoRun(session, id, type_code, body);
+                } catch (Delphi::Exception::Exception &E) {
+                    DeleteJob(id);
+                    DoError(E);
+                }
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoFatal(E);
             };
 
             CStringList SQL;
@@ -366,12 +442,16 @@ namespace Apostol {
             api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "execute");
 
-            Log()->Message("[%s] Task started.", Id.c_str());
-
             try {
-                m_Jobs.AddObject(Id, (CPQQuery *) ExecSQL(SQL, nullptr, OnExecuted, OnException));
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+
+                pQuery->Data().Values("session", Session);
+                pQuery->Data().Values("id", Id);
+                pQuery->Data().Values("type_code", TypeCode);
+                pQuery->Data().Values("body", Body);
             } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
+                DeleteJob(Id);
+                DoFatal(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -385,10 +465,48 @@ namespace Apostol {
 
             Log()->Message("[%s] Task failed.", Id.c_str());
 
+            DeleteJob(Id);
+
             try {
                 ExecSQL(SQL);
             } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
+                DoFatal(E);
+            }
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoDone(const CString &Session, const CString &Id) {
+            CStringList SQL;
+
+            api::authorize(SQL, Session);
+            api::execute_object_action(SQL, Id, "done");
+
+            Log()->Message("[%s] Task done.", Id.c_str());
+
+            DeleteJob(Id);
+
+            try {
+                ExecSQL(SQL);
+            } catch (Delphi::Exception::Exception &E) {
+                DoFatal(E);
+            }
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoComplete(const CString &Session, const CString &Id) {
+            CStringList SQL;
+
+            api::authorize(SQL, Session);
+            api::execute_object_action(SQL, Id, "complete");
+
+            Log()->Message("[%s] Task completed.", Id.c_str());
+
+            DeleteJob(Id);
+
+            try {
+                ExecSQL(SQL);
+            } catch (Delphi::Exception::Exception &E) {
+                DoFatal(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -401,10 +519,30 @@ namespace Apostol {
 
             Log()->Message("[%s] Task aborted.", Id.c_str());
 
+            DeleteJob(Id);
+
             try {
                 ExecSQL(SQL);
             } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
+                DoFatal(E);
+            }
+        }
+        //--------------------------------------------------------------------------------------------------------------
+
+        void CTaskScheduler::DoCancel(const CString &Session, const CString &Id) {
+            CStringList SQL;
+
+            api::authorize(SQL, Session);
+            api::execute_object_action(SQL, Id, "cancel");
+
+            Log()->Message("[%s] Task canceled.", Id.c_str());
+
+            DeleteJob(Id);
+
+            try {
+                ExecSQL(SQL);
+            } catch (Delphi::Exception::Exception &E) {
+                DoFatal(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -417,8 +555,8 @@ namespace Apostol {
         void CTaskScheduler::DoPostgresQueryExecuted(CPQPollQuery *APollQuery) {
             CPQResult *pResult;
             try {
-                for (int I = 0; I < APollQuery->Count(); I++) {
-                    pResult = APollQuery->Results(I);
+                for (int i = 0; i < APollQuery->Count(); i++) {
+                    pResult = APollQuery->Results(i);
 
                     if (pResult->ExecStatus() != PGRES_TUPLES_OK)
                         throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
@@ -434,15 +572,10 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoPQClientException(CPQClient *AClient, const Delphi::Exception::Exception &E) {
-            CServerProcess::DoPQClientException(AClient, E);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
         void CTaskScheduler::DoPQConnectException(CPQConnection *AConnection, const Delphi::Exception::Exception &E) {
             CServerProcess::DoPQConnectException(AConnection, E);
             if (m_Status == psRunning) {
-                DoError(E);
+                DoFatal(E);
             }
         }
     }

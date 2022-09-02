@@ -64,16 +64,25 @@ namespace Apostol {
             void CheckJobs(const CString &Session, const CPQueryResult &Jobs);
             void CheckTasks();
 
+            void DeleteJob(const CString &Id);
+
             void Heartbeat(CDateTime Now);
 
         protected:
 
             void DoTimer(CPollEventHandler *AHandler) override;
 
+            void DoFatal(const Delphi::Exception::Exception &E);
             void DoError(const Delphi::Exception::Exception &E);
 
-            void DoStart(const CString &Session, const CString &Id);
+            void DoStart(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body);
+            void DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body);
+
+            void DoDone(const CString &Session, const CString &Id);
+            void DoComplete(const CString &Session, const CString &Id);
+
             void DoAbort(const CString &Session, const CString &Id);
+            void DoCancel(const CString &Session, const CString &Id);
             void DoFail(const CString &Session, const CString &Id, const CString &Error);
 
             bool DoExecute(CTCPConnection *AConnection) override;
@@ -81,7 +90,6 @@ namespace Apostol {
             void DoPostgresQueryExecuted(CPQPollQuery *APollQuery);
             void DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E);
 
-            void DoPQClientException(CPQClient *AClient, const Delphi::Exception::Exception &E) override;
             void DoPQConnectException(CPQConnection *AConnection, const Delphi::Exception::Exception &E) override;
 
         public:
