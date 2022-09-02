@@ -232,17 +232,18 @@ namespace Apostol {
                 if (index != -1) {
                     if (state_code == "canceled") {
                         auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
-                        if (pQuery->CancelQuery(Error))
-                            DoAbort(Session, id);
-                        else
-                            DoFail(Session, id, Error);
+                        if (pQuery != nullptr) {
+                            if (pQuery->CancelQuery(Error))
+                                DoAbort(Session, id);
+                            else
+                                DoFail(Session, id, Error);
+                        }
                     }
-
-                    if (state_code == "enabled")
-                        m_Jobs.Delete(index);
                 }
 
                 if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
+                    if (index != -1)
+                        m_Jobs.Delete(index);
                     DoStart(Session, id, type_code, body);
                 } else if (state_code == "executed" && index == -1) {
                     DoCancel(Session, id);
@@ -350,7 +351,7 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body) {
+        void CTaskScheduler::DoRun(const CString &Session, int Index, const CString &Id, const CString &TypeCode, const CString &Body) {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
@@ -398,7 +399,7 @@ namespace Apostol {
                 pQuery->Data().Values("id", Id);
                 pQuery->Data().Values("type_code", TypeCode);
 
-                m_Jobs.AddObject(Id, (CPQQuery *) pQuery);
+                m_Jobs.Objects(Index, (CPQQuery *) pQuery);
             } catch (Delphi::Exception::Exception &E) {
                 DeleteJob(Id);
                 DoFatal(E);
@@ -424,16 +425,14 @@ namespace Apostol {
                             throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
                     }
 
-                    DoRun(session, id, type_code, body);
+                    DoRun(session, m_Jobs.Add(id), id, type_code, body);
                 } catch (Delphi::Exception::Exception &E) {
-                    DeleteJob(id);
                     DoError(E);
                 }
             };
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
                 const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
                 DoFatal(E);
             };
 
@@ -450,25 +449,34 @@ namespace Apostol {
                 pQuery->Data().Values("type_code", TypeCode);
                 pQuery->Data().Values("body", Body);
             } catch (Delphi::Exception::Exception &E) {
-                DeleteJob(Id);
                 DoFatal(E);
             }
         }
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoFail(const CString &Session, const CString &Id, const CString &Error) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                Log()->Message("[%s] Task failed.", id.c_str());
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoError(E);
+            };
+
             CStringList SQL;
 
             api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "fail");
             api::set_object_label(SQL, Id, Error);
 
-            Log()->Message("[%s] Task failed.", Id.c_str());
-
-            DeleteJob(Id);
-
             try {
-                ExecSQL(SQL);
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                pQuery->Data().Values("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -476,17 +484,27 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoDone(const CString &Session, const CString &Id) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                Log()->Message("[%s] Task done.", id.c_str());
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoError(E);
+            };
+
             CStringList SQL;
 
             api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "done");
 
-            Log()->Message("[%s] Task done.", Id.c_str());
-
-            DeleteJob(Id);
-
             try {
-                ExecSQL(SQL);
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                pQuery->Data().Values("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -494,17 +512,27 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoComplete(const CString &Session, const CString &Id) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                Log()->Message("[%s] Task completed.", id.c_str());
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoError(E);
+            };
+
             CStringList SQL;
 
             api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "complete");
 
-            Log()->Message("[%s] Task completed.", Id.c_str());
-
-            DeleteJob(Id);
-
             try {
-                ExecSQL(SQL);
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                pQuery->Data().Values("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -512,17 +540,27 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoAbort(const CString &Session, const CString &Id) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                Log()->Message("[%s] Task aborted.", id.c_str());
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoError(E);
+            };
+
             CStringList SQL;
 
             api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "abort");
 
-            Log()->Message("[%s] Task aborted.", Id.c_str());
-
-            DeleteJob(Id);
-
             try {
-                ExecSQL(SQL);
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                pQuery->Data().Values("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }
@@ -530,17 +568,27 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoCancel(const CString &Session, const CString &Id) {
+
+            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                Log()->Message("[%s] Task canceled.", id.c_str());
+            };
+
+            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
+                const auto &id = APollQuery->Data()["id"];
+                DeleteJob(id);
+                DoError(E);
+            };
+
             CStringList SQL;
 
             api::authorize(SQL, Session);
             api::execute_object_action(SQL, Id, "cancel");
 
-            Log()->Message("[%s] Task canceled.", Id.c_str());
-
-            DeleteJob(Id);
-
             try {
-                ExecSQL(SQL);
+                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                pQuery->Data().Values("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
             }

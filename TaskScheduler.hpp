@@ -76,7 +76,7 @@ namespace Apostol {
             void DoError(const Delphi::Exception::Exception &E);
 
             void DoStart(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body);
-            void DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body);
+            void DoRun(const CString &Session, int Index, const CString &Id, const CString &TypeCode, const CString &Body);
 
             void DoDone(const CString &Session, const CString &Id);
             void DoComplete(const CString &Session, const CString &Id);
