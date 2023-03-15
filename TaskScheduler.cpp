@@ -2,7 +2,7 @@
 
 Program name:
 
-  Apostol Web Service
+  Apostol CRM
 
 Module Name:
 
@@ -216,12 +216,12 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::CheckJobs(const CString &Session, const CPQueryResult &Jobs) {
+        void CTaskScheduler::EnumJob(const CString &Session, const CPQueryResult &List) {
             int index;
             CString Error;
 
-            for (int row = 0; row < Jobs.Count(); ++row) {
-                const auto &job = Jobs[row];
+            for (int row = 0; row < List.Count(); ++row) {
+                const auto &job = List[row];
 
                 const auto &id = job["id"];
                 const auto &type_code = job["typecode"];
@@ -253,7 +253,7 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        void CTaskScheduler::CheckTasks() {
+        void CTaskScheduler::CheckJob() {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
@@ -270,7 +270,7 @@ namespace Apostol {
                     if (authorize["authorized"] != "t")
                         throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
 
-                    CheckJobs(session, pqResults[QUERY_INDEX_DATA]);
+                    EnumJob(session, pqResults[QUERY_INDEX_DATA]);
                 } catch (Delphi::Exception::Exception &E) {
                     DoError(E);
                 }
@@ -323,7 +323,7 @@ namespace Apostol {
             if (m_Status == psRunning) {
                 if ((Now >= m_CheckDate)) {
                     m_CheckDate = Now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
-                    CheckTasks();
+                    CheckJob();
                 }
             }
         }

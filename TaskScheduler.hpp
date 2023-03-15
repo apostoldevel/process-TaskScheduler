@@ -2,7 +2,7 @@
 
 Program name:
 
-  Apostol Web Service
+  Apostol CRM
 
 Module Name:
 
@@ -41,6 +41,7 @@ namespace Apostol {
             typedef CProcessCustom inherited;
 
         private:
+
             CProcessStatus m_Status;
 
             CStringList m_Sessions;
@@ -61,8 +62,8 @@ namespace Apostol {
             void Authentication();
             void SignOut(const CString &Session);
 
-            void CheckJobs(const CString &Session, const CPQueryResult &Jobs);
-            void CheckTasks();
+            void EnumJob(const CString &Session, const CPQueryResult &List);
+            void CheckJob();
 
             void DeleteJob(const CString &Id);
 
