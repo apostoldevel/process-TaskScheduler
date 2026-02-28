@@ -1,119 +1,110 @@
-/*++
+#pragma once
 
-Program name:
+#ifdef WITH_POSTGRESQL
 
-  Apostol CRM
+#include "apostol/process_module.hpp"
 
-Module Name:
+#include "apostol/bot_session.hpp"
+#include "apostol/pg.hpp"
 
-  TaskScheduler.hpp
+#include <chrono>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
-Notices:
+namespace apostol
+{
 
-  Process: Task Scheduler
+class Application;
+class EventLoop;
+class Logger;
 
-Author:
+// ─── TaskScheduler ───────────────────────────────────────────────────────────
+//
+// Background process module that polls the db.job queue and executes SQL bodies.
+//
+// Mirrors v1 CTaskScheduler from apostol-crm.
+//
+// Architecture: logic lives here (ProcessModule), injected into a generic
+// ModuleProcess shell via add_custom_process(unique_ptr<ProcessModule>).
+// This pattern separates business logic from process lifecycle boilerplate
+// and is reused for all background processes (MessageServer, ReportServer, etc.).
+//
+// Job lifecycle:
+//   - Authenticates as "apibot" via OAuth2 client_credentials (BotSession)
+//   - Polls api.job('enabled') every heartbeat interval
+//   - Executes each job's SQL body via deferred PG queries
+//   - Periodic jobs cycle: enabled → executed → enabled (with dateRun bump)
+//   - Disposable jobs: enabled → executed → completed
+//   - Failed jobs: executed → failed (error stored as object label)
+//   - Canceled jobs: executed → canceled → aborted
+//
+// Configuration (in apostol.json):
+//   "module": {
+//     "TaskScheduler": {
+//       "enable": true,
+//       "heartbeat": 1000
+//     }
+//   }
+//
+class TaskScheduler final : public ProcessModule
+{
+public:
+    std::string_view name() const override { return "task-scheduler"; }
 
-  Copyright (c) Prepodobny Alen
+    void on_start(EventLoop& loop, Application& app) override;
+    void heartbeat(std::chrono::system_clock::time_point now) override;
+    void on_stop() override;
 
-  mailto: alienufo@inbox.ru
-  mailto: ufocomp@gmail.com
+private:
+    using time_point   = std::chrono::system_clock::time_point;
+    using milliseconds = std::chrono::milliseconds;
 
---*/
+    // ── State ────────────────────────────────────────────────────────────────
 
-#ifndef APOSTOL_PROCESS_TASK_SCHEDULER_HPP
-#define APOSTOL_PROCESS_TASK_SCHEDULER_HPP
-//----------------------------------------------------------------------------------------------------------------------
+    PgPool*     pool_{nullptr};     // borrowed from Application
+    Logger*     logger_{nullptr};   // borrowed from Application
 
-extern "C++" {
+    std::unique_ptr<BotSession> bot_;
 
-namespace Apostol {
+    enum class Status { stopped, running };
+    Status status_{Status::stopped};
 
-    namespace Processes {
+    struct Job
+    {
+        std::string id;
+        std::string type_code;
+        time_point  started_at;
+    };
 
-        //--------------------------------------------------------------------------------------------------------------
+    std::unordered_map<std::string, Job> jobs_;
 
-        //-- CTaskScheduler --------------------------------------------------------------------------------------------
+    time_point   next_check_{};
+    milliseconds check_interval_{1000};
 
-        //--------------------------------------------------------------------------------------------------------------
+    // ── Job lifecycle ────────────────────────────────────────────────────────
 
-        class CTaskScheduler: public CProcessCustom {
-            typedef CProcessCustom inherited;
+    void check_jobs();
+    void enum_jobs(std::vector<PgResult> results);
 
-        private:
+    void do_start(const std::string& id, const std::string& type_code,
+                  const std::string& body);
+    void do_run(const std::string& id, const std::string& type_code,
+                const std::string& body);
+    void do_done(const std::string& id);
+    void do_complete(const std::string& id);
+    void do_fail(const std::string& id, const std::string& error);
+    void do_abort(const std::string& id);
 
-            CProcessStatus m_Status;
+    void execute_action(const std::string& id, std::string_view action,
+                        PgQuery::ResultHandler on_result);
+    void delete_job(const std::string& id);
+    bool in_progress(const std::string& id) const;
 
-            CStringList m_Sessions;
+    void on_fatal(const std::string& error);
+};
 
-            CString m_Agent;
-            CString m_Host;
+} // namespace apostol
 
-            CDateTime m_AuthDate;
-            CDateTime m_CheckDate;
-
-            CStringList m_Jobs;
-
-            int m_HeartbeatInterval;
-
-            void BeforeRun() override;
-            void AfterRun() override;
-
-            void Authentication();
-            void SignOut(const CString &Session);
-
-            void EnumJob(const CString &Session, const CPQueryResult &List);
-            void CheckJob();
-
-            void DeleteJob(const CString &Id);
-
-            void Heartbeat(CDateTime Now);
-
-        protected:
-
-            void DoTimer(CPollEventHandler *AHandler) override;
-
-            void DoFatal(const Delphi::Exception::Exception &E);
-            void DoError(const Delphi::Exception::Exception &E);
-
-            void DoStart(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body);
-            void DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body);
-
-            void DoDone(const CString &Session, const CString &Id);
-            void DoComplete(const CString &Session, const CString &Id);
-
-            void DoAbort(const CString &Session, const CString &Id);
-            void DoCancel(const CString &Session, const CString &Id);
-            void DoFail(const CString &Session, const CString &Id, const CString &Error);
-
-            bool DoExecute(CTCPConnection *AConnection) override;
-
-            void DoPostgresQueryExecuted(CPQPollQuery *APollQuery);
-            void DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E);
-
-            void DoPQConnectException(CPQConnection *AConnection, const Delphi::Exception::Exception &E) override;
-
-        public:
-
-            explicit CTaskScheduler(CCustomProcess* AParent, CApplication *AApplication);
-
-            ~CTaskScheduler() override = default;
-
-            static class CTaskScheduler *CreateProcess(CCustomProcess *AParent, CApplication *AApplication) {
-                return new CTaskScheduler(AParent, AApplication);
-            }
-
-            bool InProgress(const CString &Id);
-
-            void Run() override;
-            void Reload() override;
-
-        };
-        //--------------------------------------------------------------------------------------------------------------
-
-    }
-}
-
-using namespace Apostol::Processes;
-}
-#endif //APOSTOL_PROCESS_TASK_SCHEDULER_HPP
+#endif // WITH_POSTGRESQL

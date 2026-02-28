@@ -2,71 +2,92 @@
 
 Task Scheduler
 -
-**TaskScheduler** is a process for [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
+
+**Process** for [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
 
 Description
 -
-**TaskScheduler** is a long-running background process that executes scheduled database jobs. It polls the job queue and runs each job's SQL body as a PostgreSQL query, tracking state transitions through the job lifecycle.
 
-The process runs independently inside the Apostol master process, sharing the same `epoll`-based event loop — no threads, no blocking I/O.
+**Task Scheduler** is a background process module for the [Apostol](https://github.com/apostoldevel/apostol) framework. It runs as an independent forked process and polls the `db.job` queue, executing the SQL body of each scheduled task.
 
-How it works
--
-1. Authenticates via OAuth2 `client_credentials` as `apibot`; re-authenticates every 24 hours.
-2. Polls `api.job('enabled')` every second.
-3. For each enabled job, transitions it to `executed` state via `api.execute_object_action(id, 'execute')`.
-4. Runs the job's `body` field directly as a SQL statement.
-5. On completion — transitions to `done` (periodic) or `complete` (one-shot).
-6. In-progress jobs with `canceled` state are cancelled by sending a PostgreSQL query cancellation.
+Key characteristics:
 
-Job lifecycle
--
+* Written in C++20 using an asynchronous, non-blocking I/O model based on the **epoll** API.
+* Connects to **PostgreSQL** via the `libpq` library using the `apibot` database role (helper connection pool).
+* Authenticates via OAuth2 `client_credentials` grant using `BotSession` — re-authenticates every 24 hours.
+* Supports two job types: **periodic** (cycles back to `enabled` after execution) and **disposable** (transitions to `completed`).
+* Handles error recovery: failed jobs are marked with the error message; the scheduler pauses for 10 seconds on fatal errors.
 
-| State | Action |
-|-------|--------|
-| `enabled` / `aborted` / `failed` | Start the job → transition to `executed` |
-| `executed` | Run `body` SQL |
-| _(done, `periodic.job`)_ | `execute_object_action('done')` — job repeats on next poll |
-| _(done, other types)_ | `execute_object_action('complete')` — one-shot, job finished |
-| `canceled` _(while running)_ | Cancel PQ query → `execute_object_action('abort')` |
-| _(SQL error)_ | `execute_object_action('fail')` — records error label |
+### Architecture
 
-Job types
--
-| Type code | Behaviour |
-|-----------|-----------|
-| `periodic.job` | Repeating: after each successful run transitions to `done` and re-runs on the next poll cycle |
-| _(any other)_ | One-shot: transitions to `complete` after first successful run |
+Task Scheduler follows the **ProcessModule** pattern introduced in apostol.v2:
 
-Jobs in `aborted` or `failed` state are automatically retried on the next poll.
+```
+Application
+  └── ModuleProcess (generic process shell: signals, EventLoop, PgPool)
+        └── TaskScheduler (ProcessModule: business logic only)
+```
 
-Database module
--
-TaskScheduler is tightly coupled to the **`job`** module of [db-platform](https://github.com/apostoldevel/db-platform) (`db/sql/platform/entity/object/document/job/`).
+The process lifecycle (signal handling, crash recovery, PgPool setup, heartbeat timer) is managed by the generic `ModuleProcess` shell. `TaskScheduler` only contains the job scheduling logic.
 
-Key database objects:
+### How it works
 
-| Object | Purpose |
-|--------|---------|
-| `db.job` | Job record: references a `scheduler` (period) and a `program` (SQL body to execute) |
-| `db.scheduler` | Defines the repeat period; `dateRun` on insert = `now() + scheduler.period` |
-| `db.program` | Stores the SQL body executed when the job fires |
-| `api.job(state)` | Returns jobs where `dateRun <= now()` and state matches (e.g. `'enabled'`) |
-| `api.execute_object_action(id, action)` | State transitions: `'execute'`, `'done'`, `'complete'`, `'abort'`, `'cancel'`, `'fail'` |
+```
+heartbeat (1s)
+  └── BotSession::refresh_if_needed()
+  └── if authenticated → check_jobs()
+        └── api.authorize(session)
+        └── api.job('enabled') ORDER BY created
+        └── enum_jobs():
+              for each job:
+                enabled/aborted/failed → do_start(id)
+                  └── api.execute_object_action(id, 'execute')
+                  └── do_run(id, body_sql)
+                        └── api.authorize(session) + <body SQL>
+                        └── periodic.job  → do_done()  → action 'done'
+                        └── disposable    → do_complete() → action 'complete'
+                        └── on error      → do_fail()  → action 'fail' + set_object_label
+                canceled → do_abort(id)
+                  └── api.execute_object_action(id, 'abort')
+```
 
-The `body` column returned by `api.job` comes from the associated `program` entity and is executed directly as a SQL statement by the scheduler process.
+### Job state machine (db-platform)
+
+```
+created ──enable──► enabled ──execute──► executed ──done────► enabled   (periodic)
+                                                   ──complete► completed (disposable)
+                                                   ──fail────► failed
+                                                   ──cancel──► canceled ──abort──► aborted
+```
 
 Configuration
 -
-```ini
-[process/TaskScheduler]
-enable=true
+
+In the application config (`conf/apostol.json`):
+
+```json
+{
+  "module": {
+    "TaskScheduler": {
+      "enable": true,
+      "heartbeat": 1000
+    }
+  }
+}
 ```
 
-No external config files are required.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enable` | bool | `false` | Enable/disable the process |
+| `heartbeat` | int | `1000` | Job check interval in milliseconds |
+
+The process also requires:
+* `postgres.helper` connection string in the config (used for the `apibot` connection pool)
+* OAuth2 `service` credentials in `conf/oauth2/default.json`
 
 Installation
 -
-Follow the build and installation instructions for [Apostol](https://github.com/apostoldevel/apostol#build-and-installation).
+
+Follow the build and installation instructions for [Apostol](https://github.com/apostoldevel/apostol#building-and-installation).
 
 [^crm]: **Apostol CRM** is an abstract term, not a standalone product. It refers to any project that uses both the [Apostol](https://github.com/apostoldevel/apostol) C++ framework and [db-platform](https://github.com/apostoldevel/db-platform) together through purpose-built modules and processes. Each framework can be used independently; combined, they form a full-stack backend platform.

@@ -1,634 +1,334 @@
-/*++
-
-Program name:
-
-  Apostol CRM
-
-Module Name:
-
-  TaskScheduler.cpp
-
-Notices:
-
-  Process: Task Scheduler
-
-Author:
-
-  Copyright (c) Prepodobny Alen
-
-  mailto: alienufo@inbox.ru
-  mailto: ufocomp@gmail.com
-
---*/
-
-#include "Core.hpp"
-#include "TaskScheduler.hpp"
-//----------------------------------------------------------------------------------------------------------------------
-
-#define SERVICE_APPLICATION_NAME "service"
-#define CONFIG_SECTION_NAME "process/TaskScheduler"
-
-#define API_BOT_USERNAME "apibot"
-
-#define QUERY_INDEX_AUTH     0
-#define QUERY_INDEX_DATA     1
-
-#define SLEEP_SECOND_AFTER_ERROR 10
-
-extern "C++" {
-
-namespace Apostol {
-
-    namespace Processes {
-
-        //--------------------------------------------------------------------------------------------------------------
-
-        //-- CTaskScheduler --------------------------------------------------------------------------------------------
-
-        //--------------------------------------------------------------------------------------------------------------
-
-        CTaskScheduler::CTaskScheduler(CCustomProcess *AParent, CApplication *AApplication):
-                inherited(AParent, AApplication, "task scheduler") {
-
-            m_Agent = CString().Format("%s (%s)", GApplication->Title().c_str(), ProcessName().c_str());
-            m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
-
-            m_AuthDate = 0;
-            m_CheckDate = 0;
-
-            m_HeartbeatInterval = 1000;
-            m_Status = psStopped;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::BeforeRun() {
-            Application()->Header(Application()->Name() + ": task scheduler");
-
-            Log()->Debug(APP_LOG_DEBUG_CORE, MSG_PROCESS_START, GetProcessName(), Application()->Header().c_str());
-
-            InitSignals();
-
-            Reload();
-
-            SetUser(Config()->User(), Config()->Group());
-
-            InitializePQClients(Application()->Title(), 1, Config()->PostgresPollMin());
-
-            SigProcMask(SIG_UNBLOCK);
-
-            SetTimerInterval(1000);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::AfterRun() {
-            CApplicationProcess::AfterRun();
-            PQClientsStop();
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        bool CTaskScheduler::InProgress(const CString &Id) {
-            return m_Jobs.IndexOf(Id) != -1;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::Run() {
-            auto &PQClient = PQClientStart("helper");
-
-            while (!sig_exiting) {
-
-                Log()->Debug(APP_LOG_DEBUG_EVENT, _T("task scheduler cycle"));
-
-                try {
-                    PQClient.Wait();
-                } catch (Delphi::Exception::Exception &E) {
-                    Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
-                }
-
-                if (sig_terminate || sig_quit) {
-                    if (sig_quit) {
-                        sig_quit = 0;
-                        Log()->Debug(APP_LOG_DEBUG_EVENT, _T("gracefully shutting down"));
-                        Application()->Header(_T("task scheduler is shutting down"));
-                    }
-
-                    if (!sig_exiting) {
-                        sig_exiting = 1;
-                    }
-                }
-
-                if (sig_reconfigure) {
-                    sig_reconfigure = 0;
-                    Log()->Debug(APP_LOG_DEBUG_EVENT, _T("reconfiguring"));
-
-                    Reload();
-                }
-
-                if (sig_reopen) {
-                    sig_reopen = 0;
-                    Log()->Debug(APP_LOG_DEBUG_EVENT, _T("reopening logs"));
-                }
-            }
-
-            Log()->Debug(APP_LOG_DEBUG_EVENT, _T("stop task scheduler"));
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::Reload() {
-            CServerProcess::Reload();
-
-            m_Sessions.Clear();
-            m_Jobs.Clear();
-
-            m_AuthDate = 0;
-            m_CheckDate = 0;
-
-            m_Status = psStopped;
-
-            Log()->Notice("[%s] Successful reloading", CONFIG_SECTION_NAME);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::Authentication() {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                CPQueryResults pqResults;
-
-                CStringList SQL;
-
-                try {
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
-
-                    const auto &login = pqResults[0];
-                    const auto &sessions = pqResults[1];
-
-                    const auto &session = login.First()["session"];
-
-                    m_Sessions.Clear();
-                    for (int i = 0; i < sessions.Count(); ++i) {
-                        m_Sessions.Add(sessions[i]["get_sessions"]);
-                    }
-
-                    m_AuthDate = Now() + (CDateTime) 24 / HoursPerDay;
-                    m_Status = psRunning;
-
-                    SignOut(session);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoFatal(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            };
-
-            const auto &caProviders = Server().Providers();
-            const auto &caProvider = caProviders.DefaultValue();
-
-            const auto &clientId = caProvider.ClientId(SERVICE_APPLICATION_NAME);
-            const auto &clientSecret = caProvider.Secret(SERVICE_APPLICATION_NAME);
-
-            CStringList SQL;
-
-            api::login(SQL, clientId, clientSecret, m_Agent, m_Host);
-            api::get_sessions(SQL, API_BOT_USERNAME, m_Agent, m_Host);
-
-            try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::SignOut(const CString &Session) {
-            CStringList SQL;
-
-            api::signout(SQL, Session);
-
-            try {
-                ExecSQL(SQL);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::EnumJob(const CString &Session, const CPQueryResult &List) {
-            int index;
-            CString Error;
-
-            for (int row = 0; row < List.Count(); ++row) {
-                const auto &job = List[row];
-
-                const auto &id = job["id"];
-                const auto &type_code = job["typecode"];
-                const auto &state_code = job["statecode"];
-                const auto &body = job["body"];
-
-                index = m_Jobs.IndexOf(id);
-                if (index != -1) {
-                    if (state_code == "canceled") {
-                        auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
-                        if (pQuery != nullptr) {
-                            if (pQuery->CancelQuery(Error)) {
-                                DoAbort(Session, id);
-                            } else {
-                                DoFail(Session, id, Error);
-                            }
-                        }
-                    }
-                } else {
-                    if (state_code == "enabled" || state_code == "aborted" || state_code == "failed") {
-                        DoStart(Session, id, type_code, body);
-                    } else if (state_code == "executed") {
-                        DoCancel(Session, id);
-                    } else if (state_code == "canceled") {
-                        DoAbort(Session, id);
-                    }
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::CheckJob() {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                CPQueryResults pqResults;
-                CStringList SQL;
-
-                const auto &session = APollQuery->Data()["session"];
-
-                try {
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
-
-                    const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
-
-                    if (authorize["authorized"] != "t")
-                        throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
-
-                    EnumJob(session, pqResults[QUERY_INDEX_DATA]);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            };
-
-            for (int i = 0; i < m_Sessions.Count(); ++i) {
-                const auto &session = m_Sessions[i];
-
-                CStringList SQL;
-
-                api::authorize(SQL, session);
-                api::job(SQL, "enabled");
-
-                try {
-                    auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                    pQuery->Data().AddPair("session", session);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoFatal(E);
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoFatal(const Delphi::Exception::Exception &E) {
-            m_AuthDate = Now() + (CDateTime) SLEEP_SECOND_AFTER_ERROR / SecsPerDay; // 10 sec;
-            m_CheckDate = m_AuthDate;
-
-            m_Status = psStopped;
-
-            Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
-            Log()->Notice("Continue after %d seconds", SLEEP_SECOND_AFTER_ERROR);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoError(const Delphi::Exception::Exception &E) {
-            Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::Heartbeat(CDateTime Now) {
-            if ((Now >= m_AuthDate)) {
-                m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
-                Authentication();
-            }
-
-            if (m_Status == psRunning) {
-                if ((Now >= m_CheckDate)) {
-                    m_CheckDate = Now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
-                    CheckJob();
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoTimer(CPollEventHandler *AHandler) {
-            uint64_t exp;
-
-            auto pTimer = dynamic_cast<CEPollTimer *> (AHandler->Binding());
-            pTimer->Read(&exp, sizeof(uint64_t));
-
-            try {
-                Heartbeat(AHandler->TimeStamp());
-            } catch (Delphi::Exception::Exception &E) {
-                DoServerEventHandlerException(AHandler, E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DeleteJob(const CString &Id) {
-            const auto index = m_Jobs.IndexOf(Id);
-            if (index != -1)
-                m_Jobs.Delete(index);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoRun(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                const auto &session = APollQuery->Data()["session"];
-                const auto &id = APollQuery->Data()["id"];
-                const auto &type_code = APollQuery->Data()["type_code"];
-
-                CPQResult *pResult;
-                try {
-                    for (int i = 0; i < APollQuery->Count(); i++) {
-                        pResult = APollQuery->Results(i);
-
-                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                    }
-
-                    if (type_code == "periodic.job") {
-                        DoDone(session, id);
-                    } else {
-                        DoComplete(session, id);
-                    }
-                } catch (Delphi::Exception::Exception &E) {
-                    DeleteJob(id);
-                    DoError(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoFatal(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            SQL.Add(Body);
-
-            Log()->Message("[%s] Task started.", Id.c_str());
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-
-                pQuery->Data().AddPair("session", Session);
-                pQuery->Data().AddPair("id", Id);
-                pQuery->Data().AddPair("type_code", TypeCode);
-
-                const auto index = m_Jobs.IndexOf(Id);
-                if (index != -1)
-                    m_Jobs.Objects(index, (CPQQuery *) pQuery);
-            } catch (Delphi::Exception::Exception &E) {
-                DeleteJob(Id);
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoStart(const CString &Session, const CString &Id, const CString &TypeCode, const CString &Body) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                const auto &session = APollQuery->Data()["session"];
-                const auto &id = APollQuery->Data()["id"];
-                const auto &type_code = APollQuery->Data()["type_code"];
-                const auto &body = APollQuery->Data()["body"];
-
-                CPQResult *pResult;
-                try {
-                    for (int i = 0; i < APollQuery->Count(); i++) {
-                        pResult = APollQuery->Results(i);
-
-                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                    }
-
-                    DoRun(session, id, type_code, body);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoFatal(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "execute");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-
-                pQuery->Data().AddPair("session", Session);
-                pQuery->Data().AddPair("id", Id);
-                pQuery->Data().AddPair("type_code", TypeCode);
-                pQuery->Data().AddPair("body", Body);
-
-                m_Jobs.Add(Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoFail(const CString &Session, const CString &Id, const CString &Error) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                Log()->Message("[%s] Task failed.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "fail");
-            api::set_object_label(SQL, Id, Error);
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoDone(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                Log()->Message("[%s] Task done.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "done");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoComplete(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                Log()->Message("[%s] Task completed.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "complete");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoAbort(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                Log()->Message("[%s] Task aborted.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "abort");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoCancel(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                Log()->Message("[%s] Task canceled.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteJob(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "cancel");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        bool CTaskScheduler::DoExecute(CTCPConnection *AConnection) {
-            return true;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoPostgresQueryExecuted(CPQPollQuery *APollQuery) {
-            CPQResult *pResult;
-            try {
-                for (int i = 0; i < APollQuery->Count(); i++) {
-                    pResult = APollQuery->Results(i);
-
-                    if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                }
-            } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-            DoError(E);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CTaskScheduler::DoPQConnectException(CPQConnection *AConnection, const Delphi::Exception::Exception &E) {
-            CServerProcess::DoPQConnectException(AConnection, E);
-            if (m_Status == psRunning) {
-                DoFatal(E);
-            }
+#ifdef WITH_POSTGRESQL
+
+#include "TaskScheduler/TaskScheduler.hpp"
+
+#include "apostol/application.hpp"
+#include "apostol/pg_utils.hpp"
+
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
+
+namespace apostol
+{
+
+// ─── on_start ────────────────────────────────────────────────────────────────
+
+void TaskScheduler::on_start(EventLoop& /*loop*/, Application& app)
+{
+    pool_   = &app.db_pool();
+    logger_ = &app.logger();
+
+    // Create BotSession for apibot authentication
+    bot_ = std::make_unique<BotSession>(*pool_, "TaskScheduler/1.0", "localhost");
+
+    // Read OAuth2 credentials from conf/oauth2/default.json → "service" app
+    auto [client_id, client_secret] = app.providers().credentials("service");
+    if (!client_id.empty())
+        bot_->set_credentials(std::move(client_id), std::move(client_secret));
+
+    // Read heartbeat interval from config
+    if (auto* cfg = app.module_config("TaskScheduler")) {
+        if (cfg->contains("heartbeat") && (*cfg)["heartbeat"].is_number())
+            check_interval_ = milliseconds((*cfg)["heartbeat"].get<int>());
+    }
+
+    logger_->notice("TaskScheduler started (check_interval={}ms)",
+                    check_interval_.count());
+}
+
+// ─── heartbeat ───────────────────────────────────────────────────────────────
+
+void TaskScheduler::heartbeat(std::chrono::system_clock::time_point now)
+{
+    if (!bot_ || !pool_)
+        return;
+
+    bot_->refresh_if_needed();
+
+    if (status_ == Status::stopped) {
+        if (bot_->valid())
+            status_ = Status::running;
+        return;
+    }
+
+    // Status::running
+    if (now >= next_check_) {
+        check_jobs();
+        next_check_ = now + check_interval_;
+    }
+}
+
+// ─── on_stop ─────────────────────────────────────────────────────────────────
+
+void TaskScheduler::on_stop()
+{
+    if (bot_)
+        bot_->sign_out();
+    bot_.reset();
+}
+
+// ─── check_jobs ──────────────────────────────────────────────────────────────
+//
+// Mirrors v1 CTaskScheduler::CheckJob():
+//   1. api.authorize(session)
+//   2. api.job('enabled') ORDER BY created
+//
+
+void TaskScheduler::check_jobs()
+{
+    if (!bot_->valid())
+        return;
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.job('enabled') ORDER BY created",
+        pq_quote_literal(bot_->session()));
+
+    pool_->execute(sql,
+        [this](std::vector<PgResult> results) {
+            enum_jobs(std::move(results));
+        },
+        [this](std::string_view error) {
+            on_fatal(std::string(error));
+        },
+        /*quiet=*/true);
+}
+
+// ─── enum_jobs ───────────────────────────────────────────────────────────────
+//
+// Mirrors v1 CTaskScheduler::EnumJob():
+//   For each job in results:
+//     - If not in_progress and state in (enabled, aborted, failed) → do_start
+//     - If in_progress and state == canceled → do_abort
+//
+
+void TaskScheduler::enum_jobs(std::vector<PgResult> results)
+{
+    // results[0] = authorize, results[1] = job list
+    if (results.size() < 2 || !results[1].ok())
+        return;
+
+    auto& res = results[1];
+    int rows = res.rows();
+
+    // Column indices (api.job returns: id, typecode, statecode, created, daterun, body)
+    int col_id        = res.column_index("id");
+    int col_typecode  = res.column_index("typecode");
+    int col_statecode = res.column_index("statecode");
+    int col_body      = res.column_index("body");
+
+    if (col_id < 0 || col_typecode < 0 || col_statecode < 0 || col_body < 0)
+        return;
+
+    for (int r = 0; r < rows; ++r) {
+        std::string id        = res.value(r, col_id)        ? res.value(r, col_id)        : "";
+        std::string type_code = res.value(r, col_typecode)  ? res.value(r, col_typecode)  : "";
+        std::string state     = res.value(r, col_statecode) ? res.value(r, col_statecode) : "";
+        std::string body      = res.value(r, col_body)      ? res.value(r, col_body)      : "";
+
+        if (id.empty())
+            continue;
+
+        if (in_progress(id)) {
+            // Already running — check if cancel was requested
+            if (state == "canceled")
+                do_abort(id);
+        } else {
+            // Not running — start if eligible
+            if (state == "enabled" || state == "aborted" || state == "failed")
+                do_start(id, type_code, body);
         }
     }
 }
 
+// ─── do_start ────────────────────────────────────────────────────────────────
+//
+// Transition: enabled/aborted/failed → executed
+// Then run the job body.
+//
+
+void TaskScheduler::do_start(const std::string& id, const std::string& type_code,
+                             const std::string& body)
+{
+    jobs_[id] = Job{id, type_code, std::chrono::system_clock::now()};
+
+    logger_->debug("TaskScheduler: starting job {} (type={})", id, type_code);
+
+    execute_action(id, "execute",
+        [this, id, type_code, body](std::vector<PgResult> /*results*/) {
+            do_run(id, type_code, body);
+        });
 }
+
+// ─── do_run ──────────────────────────────────────────────────────────────────
+//
+// Execute the job body SQL:
+//   1. api.authorize(session)
+//   2. <body SQL>
+//
+
+void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
+                           const std::string& body)
+{
+    if (!bot_->valid()) {
+        delete_job(id);
+        return;
+    }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "{}",
+        pq_quote_literal(bot_->session()),
+        body);
+
+    pool_->execute(sql,
+        [this, id, type_code](std::vector<PgResult> /*results*/) {
+            if (!in_progress(id))
+                return;
+
+            // Periodic jobs cycle back to enabled; one-shot jobs complete
+            if (type_code == "periodic.job")
+                do_done(id);
+            else
+                do_complete(id);
+        },
+        [this, id](std::string_view error) {
+            if (in_progress(id))
+                do_fail(id, std::string(error));
+            else
+                delete_job(id);
+        });
+}
+
+// ─── do_done ─────────────────────────────────────────────────────────────────
+//
+// Periodic job: executed → enabled (dateRun recalculated by EventJobDone in DB)
+//
+
+void TaskScheduler::do_done(const std::string& id)
+{
+    logger_->debug("TaskScheduler: job {} done (periodic)", id);
+
+    execute_action(id, "done",
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_job(id);
+        });
+}
+
+// ─── do_complete ─────────────────────────────────────────────────────────────
+//
+// Disposable job: executed → completed
+//
+
+void TaskScheduler::do_complete(const std::string& id)
+{
+    logger_->debug("TaskScheduler: job {} complete (disposable)", id);
+
+    execute_action(id, "complete",
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_job(id);
+        });
+}
+
+// ─── do_fail ─────────────────────────────────────────────────────────────────
+//
+// executed → failed + store error as object label
+//
+
+void TaskScheduler::do_fail(const std::string& id, const std::string& error)
+{
+    logger_->error("TaskScheduler: job {} failed: {}", id, error);
+
+    if (!bot_->valid()) {
+        delete_job(id);
+        return;
+    }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {});\n"
+        "SELECT * FROM api.set_object_label({}::uuid, {})",
+        pq_quote_literal(bot_->session()),
+        pq_quote_literal(id), pq_quote_literal("fail"),
+        pq_quote_literal(id), pq_quote_literal(error));
+
+    pool_->execute(sql,
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_job(id);
+        },
+        [this, id](std::string_view err) {
+            logger_->error("TaskScheduler: do_fail SQL error for {}: {}", id, err);
+            delete_job(id);
+        });
+}
+
+// ─── do_abort ────────────────────────────────────────────────────────────────
+//
+// canceled → aborted (in-flight SQL will finish but result is ignored)
+//
+
+void TaskScheduler::do_abort(const std::string& id)
+{
+    logger_->notice("TaskScheduler: aborting job {}", id);
+
+    execute_action(id, "abort",
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_job(id);
+        });
+}
+
+// ─── execute_action ──────────────────────────────────────────────────────────
+//
+// Helper: api.authorize(session) + api.execute_object_action(id, action)
+//
+
+void TaskScheduler::execute_action(const std::string& id, std::string_view action,
+                                   PgQuery::ResultHandler on_result)
+{
+    if (!bot_->valid()) {
+        delete_job(id);
+        return;
+    }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {})",
+        pq_quote_literal(bot_->session()),
+        pq_quote_literal(id),
+        pq_quote_literal(action));
+
+    pool_->execute(sql, std::move(on_result),
+        [this, id, act = std::string(action)](std::string_view error) {
+            logger_->error("TaskScheduler: action '{}' failed for {}: {}", act, id, error);
+            delete_job(id);
+            on_fatal(std::string(error));
+        });
+}
+
+// ─── delete_job / in_progress ────────────────────────────────────────────────
+
+void TaskScheduler::delete_job(const std::string& id)
+{
+    jobs_.erase(id);
+}
+
+bool TaskScheduler::in_progress(const std::string& id) const
+{
+    return jobs_.count(id) > 0;
+}
+
+// ─── on_fatal ────────────────────────────────────────────────────────────────
+//
+// Catastrophic error — pause for 10 seconds before retrying.
+//
+
+void TaskScheduler::on_fatal(const std::string& error)
+{
+    status_ = Status::stopped;
+    next_check_ = std::chrono::system_clock::now() + std::chrono::seconds(10);
+    logger_->error("TaskScheduler: fatal error, pausing 10s: {}", error);
+}
+
+} // namespace apostol
+
+#endif // WITH_POSTGRESQL

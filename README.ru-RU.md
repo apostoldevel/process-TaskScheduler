@@ -1,72 +1,93 @@
 [![en](https://img.shields.io/badge/lang-en-green.svg)](README.md)
 
-Планировщик заданий
+Планировщик задач
 -
-**TaskScheduler** — процесс для [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
+
+**Процесс** для [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
 
 Описание
 -
-**TaskScheduler** — долгоживущий фоновый процесс, выполняющий запланированные задания из базы данных. Опрашивает очередь заданий и выполняет SQL-тело каждого задания как запрос PostgreSQL, отслеживая переходы между состояниями в жизненном цикле задания.
 
-Процесс работает независимо внутри мастер-процесса Апостол, используя общий цикл событий на основе `epoll` — без потоков, без блокирующего ввода-вывода.
+**Планировщик задач** — фоновый процесс-модуль для фреймворка [Апостол](https://github.com/apostoldevel/apostol). Запускается как отдельный форкнутый процесс и опрашивает очередь задач `db.job`, выполняя SQL-тело каждой запланированной задачи.
 
-Принцип работы
--
-1. Авторизуется через OAuth2 `client_credentials` как `apibot`; повторная авторизация каждые 24 часа.
-2. Каждую секунду опрашивает `api.job('enabled')`.
-3. Для каждого активного задания переводит его в состояние `executed` через `api.execute_object_action(id, 'execute')`.
-4. Выполняет поле `body` задания напрямую как SQL-запрос.
-5. По завершении — переходит в `done` (периодическое) или `complete` (одноразовое).
-6. Задания в состоянии `canceled` во время выполнения отменяются через механизм отмены запросов PostgreSQL.
+Основные характеристики:
 
-Жизненный цикл задания
--
+* Написан на C++20 с использованием асинхронной неблокирующей модели ввода-вывода на базе **epoll** API.
+* Подключается к **PostgreSQL** через библиотеку `libpq`, используя роль `apibot` (пул соединений helper).
+* Аутентифицируется через OAuth2 `client_credentials` с помощью `BotSession` — повторная аутентификация каждые 24 часа.
+* Поддерживает два типа задач: **периодические** (после выполнения возвращаются в состояние `enabled`) и **одноразовые** (переходят в состояние `completed`).
+* Обрабатывает ошибки: для неуспешных задач сохраняется сообщение об ошибке; при критических ошибках планировщик приостанавливается на 10 секунд.
 
-| Состояние | Действие |
-|-----------|---------|
-| `enabled` / `aborted` / `failed` | Запустить задание → перейти в `executed` |
-| `executed` | Выполнить SQL из поля `body` |
-| _(завершено, `periodic.job`)_ | `execute_object_action('done')` — задание повторяется при следующем опросе |
-| _(завершено, другой тип)_ | `execute_object_action('complete')` — одноразовое, задание завершено |
-| `canceled` _(во время выполнения)_ | Отменить PQ-запрос → `execute_object_action('abort')` |
-| _(ошибка SQL)_ | `execute_object_action('fail')` — записать текст ошибки |
+### Архитектура
 
-Типы заданий
--
-| Код типа | Поведение |
-|----------|-----------|
-| `periodic.job` | Повторяющееся: после каждого успешного выполнения переходит в `done` и повторяется при следующем опросе |
-| _(любой другой)_ | Одноразовое: переходит в `complete` после первого успешного выполнения |
+Планировщик задач следует паттерну **ProcessModule**, введённому в apostol.v2:
 
-Задания в состоянии `aborted` или `failed` автоматически повторяются при следующем опросе.
-
-Модуль базы данных
--
-TaskScheduler тесно связан с модулем **`job`** платформы [db-platform](https://github.com/apostoldevel/db-platform) (`db/sql/platform/entity/object/document/job/`).
-
-Ключевые объекты базы данных:
-
-| Объект | Назначение |
-|--------|-----------|
-| `db.job` | Запись задания: ссылается на `scheduler` (период) и `program` (SQL-тело для выполнения) |
-| `db.scheduler` | Определяет интервал повторения; `dateRun` при вставке = `now() + scheduler.period` |
-| `db.program` | Хранит SQL-тело, выполняемое при срабатывании задания |
-| `api.job(state)` | Возвращает задания, у которых `dateRun <= now()` и состояние соответствует (например, `'enabled'`) |
-| `api.execute_object_action(id, action)` | Переходы состояний: `'execute'`, `'done'`, `'complete'`, `'abort'`, `'cancel'`, `'fail'` |
-
-Колонка `body`, возвращаемая `api.job`, берётся из связанной сущности `program` и выполняется планировщиком непосредственно как SQL-запрос.
-
-Настройка
--
-```ini
-[process/TaskScheduler]
-enable=true
+```
+Application
+  └── ModuleProcess (generic-оболочка процесса: сигналы, EventLoop, PgPool)
+        └── TaskScheduler (ProcessModule: только бизнес-логика)
 ```
 
-Внешние файлы конфигурации не требуются.
+Жизненный цикл процесса (обработка сигналов, crash recovery, настройка PgPool, таймер heartbeat) управляется generic-оболочкой `ModuleProcess`. `TaskScheduler` содержит только логику планирования задач.
+
+### Как это работает
+
+```
+heartbeat (1 сек)
+  └── BotSession::refresh_if_needed()
+  └── если аутентифицирован → check_jobs()
+        └── api.authorize(session)
+        └── api.job('enabled') ORDER BY created
+        └── enum_jobs():
+              для каждой задачи:
+                enabled/aborted/failed → do_start(id)
+                  └── api.execute_object_action(id, 'execute')
+                  └── do_run(id, body_sql)
+                        └── api.authorize(session) + <SQL-тело>
+                        └── periodic.job  → do_done()  → action 'done'
+                        └── одноразовая   → do_complete() → action 'complete'
+                        └── при ошибке    → do_fail()  → action 'fail' + set_object_label
+                canceled → do_abort(id)
+                  └── api.execute_object_action(id, 'abort')
+```
+
+### Машина состояний задачи (db-platform)
+
+```
+created ──enable──► enabled ──execute──► executed ──done────► enabled   (периодическая)
+                                                   ──complete► completed (одноразовая)
+                                                   ──fail────► failed
+                                                   ──cancel──► canceled ──abort──► aborted
+```
+
+Конфигурация
+-
+
+В конфигурационном файле приложения (`conf/apostol.json`):
+
+```json
+{
+  "module": {
+    "TaskScheduler": {
+      "enable": true,
+      "heartbeat": 1000
+    }
+  }
+}
+```
+
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|-------------|----------|
+| `enable` | bool | `false` | Включить/отключить процесс |
+| `heartbeat` | int | `1000` | Интервал проверки задач в миллисекундах |
+
+Также необходимы:
+* Строка подключения `postgres.helper` в конфигурации (используется для пула соединений `apibot`)
+* Учётные данные OAuth2 `service` в файле `conf/oauth2/default.json`
 
 Установка
 -
-Следуйте указаниям по сборке и установке [Апостол](https://github.com/apostoldevel/apostol#%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%83%D1%81%D1%82%D0%B0%D0%BD%D0%BE%D0%B2%D0%BA%D0%B0).
+
+Следуйте указаниям по сборке и установке [Апостол](https://github.com/apostoldevel/apostol#building-and-installation).
 
 [^crm]: **Apostol CRM** — абстрактный термин, а не самостоятельный продукт. Он обозначает любой проект, в котором совместно используются фреймворк [Apostol](https://github.com/apostoldevel/apostol) (C++) и [db-platform](https://github.com/apostoldevel/db-platform) через специально разработанные модули и процессы. Каждый фреймворк можно использовать независимо; вместе они образуют полноценную backend-платформу.
