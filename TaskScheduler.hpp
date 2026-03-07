@@ -76,6 +76,7 @@ private:
         std::string id;
         std::string type_code;
         time_point  started_at;
+        uint64_t    query_id{0};  // PgPool query handle for cancel
     };
 
     std::unordered_map<std::string, Job> jobs_;
@@ -95,6 +96,7 @@ private:
     void do_done(const std::string& id);
     void do_complete(const std::string& id);
     void do_fail(const std::string& id, const std::string& error);
+    void do_cancel(const std::string& id);
     void do_abort(const std::string& id);
 
     void execute_action(const std::string& id, std::string_view action,

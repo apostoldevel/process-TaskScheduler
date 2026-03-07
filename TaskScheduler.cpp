@@ -137,6 +137,10 @@ void TaskScheduler::enum_jobs(std::vector<PgResult> results)
             // Not running — start if eligible
             if (state == "enabled" || state == "aborted" || state == "failed")
                 do_start(id, type_code, body);
+            else if (state == "executed")
+                do_cancel(id);   // orphan from previous run → cancel
+            else if (state == "canceled")
+                do_abort(id);    // orphan canceled → abort
         }
     }
 }
@@ -181,7 +185,7 @@ void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
         pq_quote_literal(bot_->session()),
         body);
 
-    pool_->execute(sql,
+    auto qid = pool_->execute(sql,
         [this, id, type_code](std::vector<PgResult> /*results*/) {
             if (!in_progress(id))
                 return;
@@ -198,6 +202,11 @@ void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
             else
                 delete_job(id);
         });
+
+    // Store query handle for cancel support
+    auto it = jobs_.find(id);
+    if (it != jobs_.end())
+        it->second.query_id = qid;
 }
 
 // ─── do_done ─────────────────────────────────────────────────────────────────
@@ -262,6 +271,21 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
         });
 }
 
+// ─── do_cancel ───────────────────────────────────────────────────────────────
+//
+// Orphan cleanup: executed → canceled (job was left from a previous run)
+//
+
+void TaskScheduler::do_cancel(const std::string& id)
+{
+    logger_->notice("TaskScheduler: canceling orphan job {}", id);
+
+    execute_action(id, "cancel",
+        [this, id](std::vector<PgResult> /*results*/) {
+            do_abort(id);
+        });
+}
+
 // ─── do_abort ────────────────────────────────────────────────────────────────
 //
 // canceled → aborted (in-flight SQL will finish but result is ignored)
@@ -271,9 +295,17 @@ void TaskScheduler::do_abort(const std::string& id)
 {
     logger_->notice("TaskScheduler: aborting job {}", id);
 
+    // Cancel running SQL body if any (PQcancel → PostgreSQL)
+    auto it = jobs_.find(id);
+    if (it != jobs_.end() && it->second.query_id != 0)
+        pool_->cancel(it->second.query_id);
+
+    // Remove from tracking immediately — canceled query results will be discarded
+    delete_job(id);
+
     execute_action(id, "abort",
-        [this, id](std::vector<PgResult> /*results*/) {
-            delete_job(id);
+        [](std::vector<PgResult> /*results*/) {
+            // job already removed from jobs_
         });
 }
 
