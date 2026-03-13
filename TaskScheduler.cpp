@@ -19,7 +19,7 @@ void TaskScheduler::on_start(EventLoop& /*loop*/, Application& app)
     logger_ = &app.logger();
 
     // Create BotSession for apibot authentication
-    bot_ = std::make_unique<BotSession>(*pool_, "TaskScheduler/1.0", "localhost");
+    bot_ = std::make_unique<BotSession>(*pool_, "TaskScheduler/2.0", "127.0.0.1");
 
     // Read OAuth2 credentials from conf/oauth2/default.json → "service" app
     auto [client_id, client_secret] = app.providers().credentials("service");
