@@ -310,26 +310,11 @@ void TaskScheduler::do_abort(const std::string& id)
 }
 
 // ─── execute_action ──────────────────────────────────────────────────────────
-//
-// Helper: api.authorize(session) + api.execute_object_action(id, action)
-//
 
 void TaskScheduler::execute_action(const std::string& id, std::string_view action,
                                    PgQuery::ResultHandler on_result)
 {
-    if (!bot_->valid()) {
-        delete_job(id);
-        return;
-    }
-
-    auto sql = fmt::format(
-        "SELECT * FROM api.authorize({});\n"
-        "SELECT * FROM api.execute_object_action({}::uuid, {})",
-        pq_quote_literal(bot_->session()),
-        pq_quote_literal(id),
-        pq_quote_literal(action));
-
-    pool_->execute(sql, std::move(on_result),
+    bot_->execute_action(id, action, std::move(on_result),
         [this, id, act = std::string(action)](std::string_view error) {
             logger_->error("TaskScheduler: action '{}' failed for {}: {}", act, id, error);
             delete_job(id);
