@@ -6,7 +6,6 @@
 #include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
-#include <nlohmann/json.hpp>
 
 namespace apostol
 {
@@ -303,9 +302,11 @@ void TaskScheduler::do_abort(const std::string& id)
     // Remove from tracking immediately — canceled query results will be discarded
     delete_job(id);
 
-    execute_action(id, "abort",
-        [](std::vector<PgResult> /*results*/) {
-            // job already removed from jobs_
+    // Fire-and-forget: do not trigger on_fatal if abort action fails
+    bot_->execute_action(id, "abort",
+        [](std::vector<PgResult> /*results*/) {},
+        [this, id](std::string_view error) {
+            logger_->warn("TaskScheduler: abort action failed for {}: {}", id, error);
         });
 }
 
