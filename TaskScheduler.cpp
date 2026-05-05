@@ -362,7 +362,7 @@ namespace Apostol {
                         pResult = APollQuery->Results(i);
 
                         if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                            throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                     }
 
                     if (type_code == "periodic.job") {
@@ -421,7 +421,7 @@ namespace Apostol {
                         pResult = APollQuery->Results(i);
 
                         if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                            throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                     }
 
                     DoRun(session, id, type_code, body);
@@ -609,7 +609,7 @@ namespace Apostol {
                     pResult = APollQuery->Results(i);
 
                     if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                        throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                 }
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
