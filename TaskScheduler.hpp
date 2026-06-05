@@ -56,9 +56,6 @@ namespace Apostol {
 
             int m_HeartbeatInterval;
 
-            void BeforeRun() override;
-            void AfterRun() override;
-
             void Authentication();
             void SignOut(const CString &Session);
 
@@ -70,6 +67,9 @@ namespace Apostol {
             void Heartbeat(CDateTime Now);
 
         protected:
+
+            void BeforeRun() override;
+            void AfterRun() override;
 
             void DoTimer(CPollEventHandler *AHandler) override;
 
@@ -99,11 +99,11 @@ namespace Apostol {
 
             ~CTaskScheduler() override = default;
 
-            static class CTaskScheduler *CreateProcess(CCustomProcess *AParent, CApplication *AApplication) {
+            static CTaskScheduler *CreateProcess(CCustomProcess *AParent, CApplication *AApplication) {
                 return new CTaskScheduler(AParent, AApplication);
             }
 
-            bool InProgress(const CString &Id);
+            bool InProgress(const CString &Id) const;
 
             void Run() override;
             void Reload() override;

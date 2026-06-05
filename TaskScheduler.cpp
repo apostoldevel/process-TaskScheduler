@@ -72,7 +72,7 @@ namespace Apostol {
 
             SetUser(Config()->User(), Config()->Group());
 
-            InitializePQClients(Application()->Title(), 1, Config()->PostgresPollMin());
+            InitializePQClients(Application()->Title());
 
             SigProcMask(SIG_UNBLOCK);
 
@@ -86,7 +86,7 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
-        bool CTaskScheduler::InProgress(const CString &Id) {
+        bool CTaskScheduler::InProgress(const CString &Id) const {
             return m_Jobs.IndexOf(Id) != -1;
         }
         //--------------------------------------------------------------------------------------------------------------
@@ -152,11 +152,10 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults pqResults;
-
                 CStringList SQL;
 
                 try {
+                    CPQueryResults pqResults;
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
                     const auto &login = pqResults[0];
@@ -215,7 +214,6 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::EnumJob(const CString &Session, const CPQueryResult &List) {
-            int index;
             CString Error;
 
             for (int row = 0; row < List.Count(); ++row) {
@@ -226,10 +224,10 @@ namespace Apostol {
                 const auto &state_code = job["statecode"];
                 const auto &body = job["body"];
 
-                index = m_Jobs.IndexOf(id);
+                const auto index = m_Jobs.IndexOf(id);
                 if (index != -1) {
                     if (state_code == "canceled") {
-                        auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
+                        const auto pQuery = dynamic_cast<CPQQuery *> (m_Jobs.Objects(index));
                         if (pQuery != nullptr) {
                             if (pQuery->CancelQuery(Error)) {
                                 DoAbort(Session, id);
@@ -255,12 +253,12 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults pqResults;
                 CStringList SQL;
 
                 const auto &session = APollQuery->Data()["session"];
 
                 try {
+                    CPQueryResults pqResults;
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
                     const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
@@ -287,7 +285,7 @@ namespace Apostol {
                 api::job(SQL, "enabled");
 
                 try {
-                    auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                    const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                     pQuery->Data().AddPair("session", session);
                 } catch (Delphi::Exception::Exception &E) {
                     DoFatal(E);
@@ -313,13 +311,13 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::Heartbeat(CDateTime Now) {
-            if ((Now >= m_AuthDate)) {
+            if (Now >= m_AuthDate) {
                 m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
                 Authentication();
             }
 
             if (m_Status == psRunning) {
-                if ((Now >= m_CheckDate)) {
+                if (Now >= m_CheckDate) {
                     m_CheckDate = Now + (CDateTime) m_HeartbeatInterval / MSecsPerDay;
                     CheckJob();
                 }
@@ -330,7 +328,7 @@ namespace Apostol {
         void CTaskScheduler::DoTimer(CPollEventHandler *AHandler) {
             uint64_t exp;
 
-            auto pTimer = dynamic_cast<CEPollTimer *> (AHandler->Binding());
+            const auto pTimer = dynamic_cast<CEPollTimer *> (AHandler->Binding());
             pTimer->Read(&exp, sizeof(uint64_t));
 
             try {
@@ -356,10 +354,9 @@ namespace Apostol {
                 const auto &id = APollQuery->Data()["id"];
                 const auto &type_code = APollQuery->Data()["type_code"];
 
-                CPQResult *pResult;
                 try {
                     for (int i = 0; i < APollQuery->Count(); i++) {
-                        pResult = APollQuery->Results(i);
+                        const auto pResult = APollQuery->Results(i);
 
                         if (pResult->ExecStatus() != PGRES_TUPLES_OK)
                             throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
@@ -390,7 +387,7 @@ namespace Apostol {
             Log()->Message("[%s] Task started.", Id.c_str());
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
 
                 pQuery->Data().AddPair("session", Session);
                 pQuery->Data().AddPair("id", Id);
@@ -415,10 +412,9 @@ namespace Apostol {
                 const auto &type_code = APollQuery->Data()["type_code"];
                 const auto &body = APollQuery->Data()["body"];
 
-                CPQResult *pResult;
                 try {
                     for (int i = 0; i < APollQuery->Count(); i++) {
-                        pResult = APollQuery->Results(i);
+                        const auto pResult = APollQuery->Results(i);
 
                         if (pResult->ExecStatus() != PGRES_TUPLES_OK)
                             throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
@@ -442,7 +438,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "execute");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
 
                 pQuery->Data().AddPair("session", Session);
                 pQuery->Data().AddPair("id", Id);
@@ -477,7 +473,7 @@ namespace Apostol {
             api::set_object_label(SQL, Id, Error);
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -505,7 +501,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "done");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -533,7 +529,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "complete");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -561,7 +557,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "abort");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -589,7 +585,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "cancel");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -603,10 +599,9 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CTaskScheduler::DoPostgresQueryExecuted(CPQPollQuery *APollQuery) {
-            CPQResult *pResult;
             try {
                 for (int i = 0; i < APollQuery->Count(); i++) {
-                    pResult = APollQuery->Results(i);
+                    const auto pResult = APollQuery->Results(i);
 
                     if (pResult->ExecStatus() != PGRES_TUPLES_OK)
                         throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
