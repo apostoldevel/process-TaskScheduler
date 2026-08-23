@@ -78,19 +78,25 @@ void TaskScheduler::check_jobs()
     if (!bot_->valid())
         return;
 
-    auto sql = fmt::format(
-        "SELECT * FROM api.authorize({});\n"
-        "SELECT * FROM api.job('enabled') ORDER BY created",
-        pq_quote_literal(bot_->session()));
+    // One pass per scope. api.job answers within the authorized session's scope,
+    // so asking once under the first session would leave every other scope's jobs
+    // permanently unenumerated — which is what happened when this was ported from
+    // v1's api.get_sessions to the singular form.
+    for (const auto& session : bot_->sessions()) {
+        auto sql = fmt::format(
+            "SELECT * FROM api.authorize({});\n"
+            "SELECT * FROM api.job('enabled') ORDER BY created",
+            pq_quote_literal(session));
 
-    pool_->execute(sql,
-        [this](std::vector<PgResult> results) {
-            enum_jobs(std::move(results));
-        },
-        [this](std::string_view error) {
-            on_fatal(std::string(error));
-        },
-        /*quiet=*/true);
+        pool_->execute(sql,
+            [this, session](std::vector<PgResult> results) {
+                enum_jobs(session, std::move(results));
+            },
+            [this](std::string_view error) {
+                on_fatal(std::string(error));
+            },
+            /*quiet=*/true);
+    }
 }
 
 // ─── enum_jobs ───────────────────────────────────────────────────────────────
@@ -101,7 +107,7 @@ void TaskScheduler::check_jobs()
 //     - If in_progress and state == canceled → do_abort
 //
 
-void TaskScheduler::enum_jobs(std::vector<PgResult> results)
+void TaskScheduler::enum_jobs(const std::string& session, std::vector<PgResult> results)
 {
     // results[0] = authorize, results[1] = job list
     if (results.size() < 2 || !results[1].ok())
@@ -135,7 +141,7 @@ void TaskScheduler::enum_jobs(std::vector<PgResult> results)
         } else {
             // Not running — start if eligible
             if (state == "enabled" || state == "aborted" || state == "failed")
-                do_start(id, type_code, body);
+                do_start(session, id, type_code, body);
             else if (state == "executed")
                 do_cancel(id);   // orphan from previous run → cancel
             else if (state == "canceled")
@@ -150,10 +156,10 @@ void TaskScheduler::enum_jobs(std::vector<PgResult> results)
 // Then run the job body.
 //
 
-void TaskScheduler::do_start(const std::string& id, const std::string& type_code,
-                             const std::string& body)
+void TaskScheduler::do_start(const std::string& session, const std::string& id,
+                             const std::string& type_code, const std::string& body)
 {
-    jobs_[id] = Job{id, type_code, std::chrono::system_clock::now()};
+    jobs_[id] = Job{id, type_code, session, std::chrono::system_clock::now()};
 
     logger_->debug("TaskScheduler: starting job {} (type={})", id, type_code);
 
@@ -181,7 +187,7 @@ void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
     auto sql = fmt::format(
         "SELECT * FROM api.authorize({});\n"
         "{}",
-        pq_quote_literal(bot_->session()),
+        pq_quote_literal(job_session(id)),
         body);
 
     auto qid = pool_->execute(sql,
@@ -303,7 +309,7 @@ void TaskScheduler::do_abort(const std::string& id)
     delete_job(id);
 
     // Fire-and-forget: do not trigger on_fatal if abort action fails
-    bot_->execute_action(id, "abort",
+    bot_->execute_action(job_session(id), id, "abort",
         [](std::vector<PgResult> /*results*/) {},
         [this, id](std::string_view error) {
             logger_->warn("TaskScheduler: abort action failed for {}: {}", id, error);
@@ -315,7 +321,7 @@ void TaskScheduler::do_abort(const std::string& id)
 void TaskScheduler::execute_action(const std::string& id, std::string_view action,
                                    PgQuery::ResultHandler on_result)
 {
-    bot_->execute_action(id, action, std::move(on_result),
+    bot_->execute_action(job_session(id), id, action, std::move(on_result),
         [this, id, act = std::string(action)](std::string_view error) {
             logger_->error("TaskScheduler: action '{}' failed for {}: {}", act, id, error);
             delete_job(id);
@@ -328,6 +334,12 @@ void TaskScheduler::execute_action(const std::string& id, std::string_view actio
 void TaskScheduler::delete_job(const std::string& id)
 {
     jobs_.erase(id);
+}
+
+std::string TaskScheduler::job_session(const std::string& id) const
+{
+    auto it = jobs_.find(id);
+    return it == jobs_.end() ? std::string() : it->second.session;
 }
 
 bool TaskScheduler::in_progress(const std::string& id) const

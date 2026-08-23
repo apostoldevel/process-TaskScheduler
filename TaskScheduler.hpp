@@ -75,6 +75,7 @@ private:
     {
         std::string id;
         std::string type_code;
+        std::string session;      // the scope this job was found in; act in it
         time_point  started_at;
         uint64_t    query_id{0};  // PgPool query handle for cancel
     };
@@ -87,12 +88,15 @@ private:
     // ── Job lifecycle ────────────────────────────────────────────────────────
 
     void check_jobs();
-    void enum_jobs(std::vector<PgResult> results);
+    void enum_jobs(const std::string& session, std::vector<PgResult> results);
 
-    void do_start(const std::string& id, const std::string& type_code,
-                  const std::string& body);
+    void do_start(const std::string& session, const std::string& id,
+                  const std::string& type_code, const std::string& body);
     void do_run(const std::string& id, const std::string& type_code,
                 const std::string& body);
+
+    /// The session a job was enumerated under, or empty if it is no longer tracked.
+    std::string job_session(const std::string& id) const;
     void do_done(const std::string& id);
     void do_complete(const std::string& id);
     void do_fail(const std::string& id, const std::string& error);
