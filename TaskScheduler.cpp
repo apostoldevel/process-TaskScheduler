@@ -190,6 +190,9 @@ void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
         pq_quote_literal(job_session(id)),
         body);
 
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
     auto qid = pool_->execute(sql,
         [this, id, type_code](std::vector<PgResult> /*results*/) {
             if (!in_progress(id))
@@ -206,7 +209,8 @@ void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
                 do_fail(id, std::string(error));
             else
                 delete_job(id);
-        });
+        },
+        /*quiet=*/true);
 
     // Store query handle for cancel support
     auto it = jobs_.find(id);
@@ -266,6 +270,9 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
         pq_quote_literal(id), pq_quote_literal("fail"),
         pq_quote_literal(id), pq_quote_literal(error));
 
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
     pool_->execute(sql,
         [this, id](std::vector<PgResult> /*results*/) {
             delete_job(id);
@@ -273,7 +280,8 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
         [this, id](std::string_view err) {
             logger_->error("TaskScheduler: do_fail SQL error for {}: {}", id, err);
             delete_job(id);
-        });
+        },
+        /*quiet=*/true);
 }
 
 // ─── do_cancel ───────────────────────────────────────────────────────────────
