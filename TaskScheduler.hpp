@@ -12,7 +12,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace apostol
 {
@@ -83,11 +82,6 @@ private:
 
     std::unordered_map<std::string, Job> jobs_;
 
-    /// Jobs with a cancel or abort in flight. Orphan cleanup acts on jobs that are
-    /// deliberately NOT in jobs_, so nothing else stops two consecutive passes from
-    /// asking twice; the second ask arrives after the state has moved and fails.
-    std::unordered_set<std::string> cleaning_;
-
     time_point   next_check_{};
     milliseconds check_interval_{1000};
 
@@ -128,6 +122,20 @@ private:
     void execute_action(const std::string& session, const std::string& id,
                         std::string_view action,
                         PgQuery::ResultHandler on_result);
+    /// True when an action statement came back and its second result is ok.
+    ///
+    /// This is the ONLY way a failed action can be noticed: PgPool delivers a SQL error
+    /// through the RESULT handler, not the exception one — PgQuery::fail has no call
+    /// sites in the library, so every on_exception passed to pool_->execute is dead.
+    /// Taking success on faith here would send an abort at an object the cancel never
+    /// moved, fail again, and repeat every second.
+    static bool action_ok(const std::vector<PgResult>& results);
+
+    /// The database's own words for a failed statement batch. When the batch stopped at
+    /// the first statement there is no second result, and the reason is in the first —
+    /// saying "no result" there would repeat the misdirection T217 was opened for.
+    static std::string result_error(const std::vector<PgResult>& results);
+
     void delete_job(const std::string& id);
     bool in_progress(const std::string& id) const;
 

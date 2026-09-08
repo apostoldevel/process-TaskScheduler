@@ -110,7 +110,7 @@ void TaskScheduler::check_jobs()
 void TaskScheduler::enum_jobs(const std::string& session, std::vector<PgResult> results)
 {
     // results[0] = authorize, results[1] = job list
-    if (results.size() < 2 || !results[1].ok())
+    if (!action_ok(results))
         return;
 
     auto& res = results[1];
@@ -311,15 +311,6 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
 
 void TaskScheduler::do_cancel(const std::string& session, const std::string& id)
 {
-    // One cleanup in flight per job. check_jobs does not wait for outstanding work and
-    // an orphan is deliberately not tracked in jobs_, so the next pass — a second
-    // later — enumerates the same 'executed' row and asks again. The second ask lands
-    // on an object that is already 'canceled', where the workflow has no 'cancel'
-    // method (job/init.sql), and that failure would stall the whole scheduler for ten
-    // seconds on the path that has just succeeded.
-    if (!cleaning_.insert(id).second)
-        return;
-
     logger_->notice("TaskScheduler: canceling orphan job {}", id);
 
     // The scope travels in from enum_jobs. It cannot be read back from jobs_ here:
@@ -328,8 +319,32 @@ void TaskScheduler::do_cancel(const std::string& session, const std::string& id)
     // refuses an empty session before reaching the database — the action was never
     // issued, the job stayed 'executed', and the next pass repeated it forever.
     execute_action(session, id, "cancel",
-        [this, session, id](std::vector<PgResult> /*results*/) {
-            cleaning_.erase(id);
+        [this, session, id](std::vector<PgResult> results) {
+            // The result is examined, not the exception handler: a SQL refusal arrives
+            // HERE, as a non-ok result, and the handler below is reachable only through
+            // BotSession's own synchronous refusals. Proceeding to do_abort on a cancel
+            // that did not take would ask the workflow for a transition it has no method
+            // for, fail, and be repeated by the next pass a second later.
+            //
+            // on_fatal is kept deliberately, and the comparison that decides it is
+            // with PRODUCTION, not with the previous revision of this file. Today the
+            // live stacks run this very pause every ten seconds, for every pass, on all
+            // four sites: that is what T192 measures. Keeping it means the worst case
+            // after this change is exactly the worst case before it, while the cause
+            // that fires it there — an empty session — is gone. Dropping it would
+            // confine the damage to one job but print once a second instead of once per
+            // ten, five times denser than the flood this card exists to remove.
+            //
+            // Neither choice is right, and that is the point: without a per-job backoff
+            // there is no option that is both quiet and confined. That backoff is card
+            // T219, and it is the other half of this fix, not an improvement on it.
+            if (!action_ok(results)) {
+                logger_->error("TaskScheduler: cancel refused for {}: {}", id,
+                               result_error(results));
+                on_fatal("cancel refused by the database");
+                return;
+            }
+
             do_abort(session, id);
         });
 }
@@ -341,11 +356,6 @@ void TaskScheduler::do_cancel(const std::string& session, const std::string& id)
 
 void TaskScheduler::do_abort(const std::string& session, const std::string& id)
 {
-    // Same guard as do_cancel: an aborted job leaves jobs_ but keeps its 'canceled'
-    // state until the action commits, so the next pass would enumerate it again.
-    if (!cleaning_.insert(id).second)
-        return;
-
     logger_->notice("TaskScheduler: aborting job {}", id);
 
     // Cancel running SQL body if any (PQcancel → PostgreSQL)
@@ -361,11 +371,16 @@ void TaskScheduler::do_abort(const std::string& session, const std::string& id)
     // abort — tracked or orphaned alike. This branch has never worked since 2026-08-23.
     // Fire-and-forget: do not trigger on_fatal if abort action fails
     bot_->execute_action(session, id, "abort",
-        [this, id](std::vector<PgResult> /*results*/) {
-            cleaning_.erase(id);
+        [this, id](std::vector<PgResult> results) {
+            // Same contract as above: a refusal arrives as a non-ok result, not through
+            // the handler. Fire-and-forget stays fire-and-forget — this is said, not
+            // acted upon — but it is said with the database's own words rather than
+            // left invisible, which is how the previous refusal spent a day unread.
+            if (!action_ok(results))
+                logger_->warn("TaskScheduler: abort refused for {}: {}", id,
+                              result_error(results));
         },
         [this, id](std::string_view error) {
-            cleaning_.erase(id);
             logger_->warn("TaskScheduler: abort action failed for {}: {}", id, error);
         });
 }
@@ -385,13 +400,30 @@ void TaskScheduler::execute_action(const std::string& session, const std::string
     bot_->execute_action(session, id, action, std::move(on_result),
         [this, id, act = std::string(action)](std::string_view error) {
             logger_->error("TaskScheduler: action '{}' failed for {}: {}", act, id, error);
-            cleaning_.erase(id);
             delete_job(id);
             on_fatal(std::string(error));
         });
 }
 
 // ─── delete_job / in_progress ────────────────────────────────────────────────
+
+bool TaskScheduler::action_ok(const std::vector<PgResult>& results)
+{
+    return results.size() >= 2 && results[1].ok();
+}
+
+std::string TaskScheduler::result_error(const std::vector<PgResult>& results)
+{
+    // PostgreSQL's simple query protocol abandons the rest of the batch at the first
+    // error, so a failure in api.authorize leaves ONE result — and the reason in it.
+    for (const auto& r : results) {
+        if (!r.ok())
+            return r.error_message();
+    }
+
+    return results.empty() ? std::string("no result at all")
+                           : std::string("no failing result");
+}
 
 void TaskScheduler::delete_job(const std::string& id)
 {
