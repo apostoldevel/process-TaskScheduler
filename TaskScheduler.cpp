@@ -137,15 +137,15 @@ void TaskScheduler::enum_jobs(const std::string& session, std::vector<PgResult> 
         if (in_progress(id)) {
             // Already running — check if cancel was requested
             if (state == "canceled")
-                do_abort(id);
+                do_abort(session, id);
         } else {
             // Not running — start if eligible
             if (state == "enabled" || state == "aborted" || state == "failed")
                 do_start(session, id, type_code, body);
             else if (state == "executed")
-                do_cancel(id);   // orphan from previous run → cancel
+                do_cancel(session, id);   // orphan from previous run → cancel
             else if (state == "canceled")
-                do_abort(id);    // orphan canceled → abort
+                do_abort(session, id);    // orphan canceled → abort
         }
     }
 }
@@ -163,9 +163,12 @@ void TaskScheduler::do_start(const std::string& session, const std::string& id,
 
     logger_->debug("TaskScheduler: starting job {} (type={})", id, type_code);
 
-    execute_action(id, "execute",
-        [this, id, type_code, body](std::vector<PgResult> /*results*/) {
-            do_run(id, type_code, body);
+    // Explicit scope, though the entry was inserted one line above: reading it back
+    // out of jobs_ is the very pattern this file was fixed to stop using, and with a
+    // fallback in place a future breakage would be silent instead of loud.
+    execute_action(session, id, "execute",
+        [this, session, id, type_code, body](std::vector<PgResult> /*results*/) {
+            do_run(session, id, type_code, body);
         });
 }
 
@@ -176,10 +179,23 @@ void TaskScheduler::do_start(const std::string& session, const std::string& id,
 //   2. <body SQL>
 //
 
-void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
-                           const std::string& body)
+void TaskScheduler::do_run(const std::string& session, const std::string& id,
+                           const std::string& type_code, const std::string& body)
 {
+    // The job may have been aborted while the 'execute' action was in flight: a pass
+    // between do_start and this callback can enumerate it as 'canceled', run do_abort
+    // and erase the entry. Running the body afterwards would execute work that was
+    // deliberately stopped. Until the scope became explicit this was prevented only by
+    // accident — the lookup returned an empty session and api.authorize refused.
+    if (!in_progress(id))
+        return;
+
     if (!bot_->valid()) {
+        // The job is already 'executed' in the database and is about to leave our
+        // tracking: that is exactly how an orphan is born. Say so — until this line
+        // existed, an orphan appeared in the database without a word in the log.
+        logger_->warn("TaskScheduler: dropping job {} before run — no session; "
+                      "it stays 'executed' in the database", id);
         delete_job(id);
         return;
     }
@@ -187,7 +203,7 @@ void TaskScheduler::do_run(const std::string& id, const std::string& type_code,
     auto sql = fmt::format(
         "SELECT * FROM api.authorize({});\n"
         "{}",
-        pq_quote_literal(job_session(id)),
+        pq_quote_literal(session),
         body);
 
     // quiet: the statement carries a session code. PgPool prints statement
@@ -258,6 +274,10 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
     logger_->error("TaskScheduler: job {} failed: {}", id, error);
 
     if (!bot_->valid()) {
+        // Same as in do_run: dropped here, the job keeps its 'executed' state and
+        // becomes an orphan for the next pass. Do not let that happen silently.
+        logger_->warn("TaskScheduler: cannot record failure of job {} — no session; "
+                      "it stays 'executed' in the database", id);
         delete_job(id);
         return;
     }
@@ -266,7 +286,7 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
         "SELECT * FROM api.authorize({});\n"
         "SELECT * FROM api.execute_object_action({}::uuid, {});\n"
         "SELECT * FROM api.set_object_label({}::uuid, {})",
-        pq_quote_literal(bot_->session()),
+        pq_quote_literal(job_session(id)),
         pq_quote_literal(id), pq_quote_literal("fail"),
         pq_quote_literal(id), pq_quote_literal(error));
 
@@ -289,13 +309,28 @@ void TaskScheduler::do_fail(const std::string& id, const std::string& error)
 // Orphan cleanup: executed → canceled (job was left from a previous run)
 //
 
-void TaskScheduler::do_cancel(const std::string& id)
+void TaskScheduler::do_cancel(const std::string& session, const std::string& id)
 {
+    // One cleanup in flight per job. check_jobs does not wait for outstanding work and
+    // an orphan is deliberately not tracked in jobs_, so the next pass — a second
+    // later — enumerates the same 'executed' row and asks again. The second ask lands
+    // on an object that is already 'canceled', where the workflow has no 'cancel'
+    // method (job/init.sql), and that failure would stall the whole scheduler for ten
+    // seconds on the path that has just succeeded.
+    if (!cleaning_.insert(id).second)
+        return;
+
     logger_->notice("TaskScheduler: canceling orphan job {}", id);
 
-    execute_action(id, "cancel",
-        [this, id](std::vector<PgResult> /*results*/) {
-            do_abort(id);
+    // The scope travels in from enum_jobs. It cannot be read back from jobs_ here:
+    // this branch is reached precisely when the job is NOT tracked, so the map has
+    // no entry and never will. Asking it returned an empty session, and BotSession
+    // refuses an empty session before reaching the database — the action was never
+    // issued, the job stayed 'executed', and the next pass repeated it forever.
+    execute_action(session, id, "cancel",
+        [this, session, id](std::vector<PgResult> /*results*/) {
+            cleaning_.erase(id);
+            do_abort(session, id);
         });
 }
 
@@ -304,8 +339,13 @@ void TaskScheduler::do_cancel(const std::string& id)
 // canceled → aborted (in-flight SQL will finish but result is ignored)
 //
 
-void TaskScheduler::do_abort(const std::string& id)
+void TaskScheduler::do_abort(const std::string& session, const std::string& id)
 {
+    // Same guard as do_cancel: an aborted job leaves jobs_ but keeps its 'canceled'
+    // state until the action commits, so the next pass would enumerate it again.
+    if (!cleaning_.insert(id).second)
+        return;
+
     logger_->notice("TaskScheduler: aborting job {}", id);
 
     // Cancel running SQL body if any (PQcancel → PostgreSQL)
@@ -316,10 +356,16 @@ void TaskScheduler::do_abort(const std::string& id)
     // Remove from tracking immediately — canceled query results will be discarded
     delete_job(id);
 
+    // The scope comes from enum_jobs, not from jobs_: the entry has just been erased
+    // one line above, so reading it back here yielded an empty session on every
+    // abort — tracked or orphaned alike. This branch has never worked since 2026-08-23.
     // Fire-and-forget: do not trigger on_fatal if abort action fails
-    bot_->execute_action(job_session(id), id, "abort",
-        [](std::vector<PgResult> /*results*/) {},
+    bot_->execute_action(session, id, "abort",
+        [this, id](std::vector<PgResult> /*results*/) {
+            cleaning_.erase(id);
+        },
         [this, id](std::string_view error) {
+            cleaning_.erase(id);
             logger_->warn("TaskScheduler: abort action failed for {}: {}", id, error);
         });
 }
@@ -329,9 +375,17 @@ void TaskScheduler::do_abort(const std::string& id)
 void TaskScheduler::execute_action(const std::string& id, std::string_view action,
                                    PgQuery::ResultHandler on_result)
 {
-    bot_->execute_action(job_session(id), id, action, std::move(on_result),
+    execute_action(job_session(id), id, action, std::move(on_result));
+}
+
+void TaskScheduler::execute_action(const std::string& session, const std::string& id,
+                                   std::string_view action,
+                                   PgQuery::ResultHandler on_result)
+{
+    bot_->execute_action(session, id, action, std::move(on_result),
         [this, id, act = std::string(action)](std::string_view error) {
             logger_->error("TaskScheduler: action '{}' failed for {}: {}", act, id, error);
+            cleaning_.erase(id);
             delete_job(id);
             on_fatal(std::string(error));
         });
@@ -346,8 +400,13 @@ void TaskScheduler::delete_job(const std::string& id)
 
 std::string TaskScheduler::job_session(const std::string& id) const
 {
+    // Fall back to the first session rather than to an empty one, as MessageServer
+    // and ReportServer do. An empty session is refused by BotSession before the
+    // statement is built, so the caller gets "not authenticated" for an object that
+    // has nothing to do with authentication. A first-scope guess can still fail, but
+    // it fails in the database, where the error names the real problem.
     auto it = jobs_.find(id);
-    return it == jobs_.end() ? std::string() : it->second.session;
+    return it == jobs_.end() ? bot_->session() : it->second.session;
 }
 
 bool TaskScheduler::in_progress(const std::string& id) const
