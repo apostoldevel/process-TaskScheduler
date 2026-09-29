@@ -243,10 +243,14 @@ void TaskScheduler::do_done(const std::string& id)
 {
     logger_->debug("TaskScheduler: job {} done (periodic)", id);
 
+    // Sent again after a lost connection (T627): `done` and `complete` exist
+    // only in state `executed`, so a repeat of one that committed is refused
+    // by the workflow and lands where `never` would have — the error handler.
     execute_action(id, "done",
         [this, id](std::vector<PgResult> /*results*/) {
             delete_job(id);
-        });
+        },
+        PgRetry::if_lost);
 }
 
 // ─── do_complete ─────────────────────────────────────────────────────────────
@@ -258,10 +262,12 @@ void TaskScheduler::do_complete(const std::string& id)
 {
     logger_->debug("TaskScheduler: job {} complete (disposable)", id);
 
+    // Sent again after a lost connection — see do_done.
     execute_action(id, "complete",
         [this, id](std::vector<PgResult> /*results*/) {
             delete_job(id);
-        });
+        },
+        PgRetry::if_lost);
 }
 
 // ─── do_fail ─────────────────────────────────────────────────────────────────
@@ -320,9 +326,9 @@ void TaskScheduler::do_cancel(const std::string& session, const std::string& id)
     // issued, the job stayed 'executed', and the next pass repeated it forever.
     execute_action(session, id, "cancel",
         [this, session, id](std::vector<PgResult> results) {
-            // The result is examined, not the exception handler: a SQL refusal arrives
-            // HERE, as a non-ok result, and the handler below is reachable only through
-            // BotSession's own synchronous refusals. Proceeding to do_abort on a cancel
+            // The result is examined as well as the exception handler: until libapostol
+            // b7cc42d (09.09) a SQL refusal arrived HERE, as a non-ok result; now it goes
+            // to the handler, as do BotSession's own refusals. Proceeding to do_abort on a cancel
             // that did not take would ask the workflow for a transition it has no method
             // for, fail, and be repeated by the next pass a second later.
             //
@@ -388,21 +394,22 @@ void TaskScheduler::do_abort(const std::string& session, const std::string& id)
 // ─── execute_action ──────────────────────────────────────────────────────────
 
 void TaskScheduler::execute_action(const std::string& id, std::string_view action,
-                                   PgQuery::ResultHandler on_result)
+                                   PgQuery::ResultHandler on_result, PgRetry retry)
 {
-    execute_action(job_session(id), id, action, std::move(on_result));
+    execute_action(job_session(id), id, action, std::move(on_result), retry);
 }
 
 void TaskScheduler::execute_action(const std::string& session, const std::string& id,
                                    std::string_view action,
-                                   PgQuery::ResultHandler on_result)
+                                   PgQuery::ResultHandler on_result, PgRetry retry)
 {
     bot_->execute_action(session, id, action, std::move(on_result),
         [this, id, act = std::string(action)](std::string_view error) {
             logger_->error("TaskScheduler: action '{}' failed for {}: {}", act, id, error);
             delete_job(id);
             on_fatal(std::string(error));
-        });
+        },
+        retry);
 }
 
 // ─── delete_job / in_progress ────────────────────────────────────────────────

@@ -117,18 +117,21 @@ private:
 
     /// Acts under the scope the job is tracked in, falling back to the first session.
     void execute_action(const std::string& id, std::string_view action,
-                        PgQuery::ResultHandler on_result);
+                        PgQuery::ResultHandler on_result,
+                        PgRetry retry = PgRetry::never);
     /// Acts under an explicit scope — use this when the job came from enumeration.
     void execute_action(const std::string& session, const std::string& id,
                         std::string_view action,
-                        PgQuery::ResultHandler on_result);
+                        PgQuery::ResultHandler on_result,
+                        PgRetry retry = PgRetry::never);
     /// True when an action statement came back and its second result is ok.
     ///
-    /// This is the ONLY way a failed action can be noticed: PgPool delivers a SQL error
-    /// through the RESULT handler, not the exception one — PgQuery::fail has no call
-    /// sites in the library, so every on_exception passed to pool_->execute is dead.
-    /// Taking success on faith here would send an abort at an object the cancel never
-    /// moved, fail again, and repeat every second.
+    /// Until libapostol b7cc42d (09.09) this was the ONLY way a failed action could be
+    /// noticed: PgPool delivered a SQL error through the RESULT handler. Now it goes to
+    /// on_exception when there is one — execute_action always passes one — and this
+    /// check stays as the guard for a result that is not ok all the same. Taking
+    /// success on faith would send an abort at an object the cancel never moved, fail
+    /// again, and repeat every second.
     static bool action_ok(const std::vector<PgResult>& results);
 
     /// The database's own words for a failed statement batch. When the batch stopped at
