@@ -6,16 +6,48 @@
 #include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cstdlib>
 
 namespace apostol
 {
 
+namespace
+{
+
+// The mode and the lease of the channel `job`, read without an error where the
+// database has no notify module: the function is looked up first, and PL/pgSQL
+// plans the call only when the branch runs. A failed read would be logged by the
+// pool once a second on every database that predates the module.
+constexpr std::string_view kModeSql =
+    "DO $ts$\n"
+    "BEGIN\n"
+    "  IF to_regprocedure('notify.channel_policy(text)') IS NOT NULL THEN\n"
+    "    PERFORM set_config('task_scheduler.mode', coalesce(p.mode, ''), true),\n"
+    "            set_config('task_scheduler.lease', coalesce((extract(epoch FROM p.lease) * 1000)::bigint::text, ''), true)\n"
+    "       FROM notify.channel_policy('job') p;\n"
+    "  END IF;\n"
+    "END\n"
+    "$ts$;\n"
+    "SELECT current_setting('task_scheduler.mode', true), current_setting('task_scheduler.lease', true)";
+
+std::string text_at(const PgResult& r, int row, int col)
+{
+    return r.is_null(row, col) ? std::string() : std::string(r.value(row, col));
+}
+
+} // namespace
+
 // ─── on_start ────────────────────────────────────────────────────────────────
 
-void TaskScheduler::on_start(EventLoop& /*loop*/, Application& app)
+void TaskScheduler::on_start(EventLoop& loop, Application& app)
 {
     pool_   = &app.db_pool();
     logger_ = &app.logger();
+    loop_   = &loop;
+    node_   = app.node_id();
 
     // Create BotSession for apibot authentication
     bot_ = std::make_unique<BotSession>(*pool_, "TaskScheduler/2.0", "127.0.0.1");
@@ -57,10 +89,31 @@ void TaskScheduler::heartbeat(std::chrono::system_clock::time_point now)
     }
 }
 
-// ─── on_stop ─────────────────────────────────────────────────────────────────
+// ─── on_stopping / busy / on_stop ────────────────────────────────────────────
+
+void TaskScheduler::on_stopping()
+{
+    // Not chosen as an addressee any more, nothing new taken; a row taken goes
+    // on to its end. The path `legacy` takes nothing between ticks.
+    if (notify_)
+        notify_->drain();
+}
+
+bool TaskScheduler::busy() const
+{
+    // Rows taken and not yet completed — a claim in flight. A body sent with its
+    // ack is the pool's to count.
+    return notify_ && notify_->busy();
+}
 
 void TaskScheduler::on_stop()
 {
+    // First: the rows still here go back (nack) and the subscriber is
+    // deregistered, on the listener, while the pool is still there.
+    if (notify_)
+        notify_->stop();
+    notify_.reset();
+
     if (bot_)
         bot_->sign_out();
     bot_.reset();
@@ -68,16 +121,64 @@ void TaskScheduler::on_stop()
 
 // ─── check_jobs ──────────────────────────────────────────────────────────────
 //
-// Mirrors v1 CTaskScheduler::CheckJob():
-//   1. api.authorize(session)
-//   2. api.job('enabled') ORDER BY created
+// The mode of the channel `job`, read now — every tick, never kept from the last
+// one (T1104): `single` — the database hands out the runs (offer_jobs); anything
+// else — the poll (poll_jobs).
 //
 
 void TaskScheduler::check_jobs()
 {
-    if (!bot_->valid())
+    if (!bot_->valid() || mode_in_flight_)
         return;
 
+    mode_in_flight_ = true;
+
+    // No error handler: a refusal comes to the result handler, as in the poll.
+    pool_->execute(std::string(kModeSql),
+        [this](std::vector<PgResult> results) {
+            mode_in_flight_ = false;
+            on_mode(std::move(results));
+        },
+        {}, /*quiet=*/true);
+}
+
+void TaskScheduler::on_mode(std::vector<PgResult> results)
+{
+    // results[0] = DO, results[1] = mode and lease
+    if (!action_ok(results) || results[1].rows() != 1) {
+        // Not an answer. Polling now could make this the second executor of a
+        // channel that is `single`: wait, as after any other failure.
+        on_fatal(fmt::format("the mode of the channel job is unknown: {}", result_error(results)));
+        return;
+    }
+
+    const auto& r = results[1];
+
+    // The lease bounds the body on both paths (T1104, З1): a body that runs by
+    // the poll at the moment of the switch is left alone by api.job_due only while
+    // it is younger than the lease. No channel — no lease, no bound, as before.
+    lease_ = milliseconds(std::strtoll(text_at(r, 0, 1).c_str(), nullptr, 10));
+
+    if (text_at(r, 0, 0) != "single") {
+        // A subscriber left active next to the poll would still take rows, and
+        // the poll would cancel what it runs as an orphan.
+        stop_notify();
+        poll_jobs();
+        return;
+    }
+
+    offer_jobs();
+}
+
+// ─── poll_jobs ───────────────────────────────────────────────────────────────
+//
+// Path `legacy`. Mirrors v1 CTaskScheduler::CheckJob():
+//   1. api.authorize(session)
+//   2. api.job('enabled') ORDER BY created
+//
+
+void TaskScheduler::poll_jobs()
+{
     // One pass per scope. api.job answers within the authorized session's scope,
     // so asking once under the first session would leave every other scope's jobs
     // permanently unenumerated — which is what happened when this was ported from
@@ -150,6 +251,328 @@ void TaskScheduler::enum_jobs(const std::string& session, std::vector<PgResult> 
     }
 }
 
+// ─── offer_jobs ──────────────────────────────────────────────────────────────
+//
+// Path `single`, in every scope:
+//   1. api.authorize(session)
+//   2. the session's scope (api.current_area — apibot has no USAGE on kernel,
+//      where current_scope lives) — the row names its scope; the claim needs
+//      the session
+//   3. api.job_due()     — the due runs become rows of the channel `job`
+//
+// api.job_due is not asked before this process has a subscriber number: a row it
+// writes is offered to the live subscribers, and until then this one is not.
+//
+
+void TaskScheduler::offer_jobs()
+{
+    const bool subscribed = notify_ && notify_->number() != 0;
+
+    for (const auto& session : bot_->sessions()) {
+        auto sql = fmt::format(
+            "SELECT * FROM api.authorize({});\n"
+            "SELECT scope FROM api.current_area()",
+            pq_quote_literal(session));
+
+        if (subscribed)
+            sql += ";\nSELECT * FROM api.job_due()";
+
+        pool_->execute(std::move(sql),
+            [this, session](std::vector<PgResult> results) {
+                on_offered(session, std::move(results));
+            },
+            [this](std::string_view error) {
+                on_fatal(std::string(error));
+            },
+            /*quiet=*/true);
+    }
+}
+
+void TaskScheduler::on_offered(const std::string& session, std::vector<PgResult> results)
+{
+    // results[0] = authorize, results[1] = scope, results[2] = the runs offered
+    if (!action_ok(results))
+        return;
+
+    if (results[1].rows() != 1) {
+        // Its rows would be refused for want of a session — and with no scope
+        // known at all, no subscriber is made: say so rather than fall silent.
+        logger_->warn("TaskScheduler: the scope of a session is not known ({} row(s) from api.current_area)",
+                      results[1].rows());
+        return;
+    }
+
+    const std::string scope = text_at(results[1], 0, 0);
+    if (!scope.empty())
+        scope_sessions_[scope] = session;
+
+    if (!notify_)
+        start_notify();
+
+    if (results.size() >= 3 && results[2].ok() && results[2].rows() > 0)
+        logger_->debug("TaskScheduler: {} job(s) offered in scope {}", results[2].rows(), scope);
+}
+
+void TaskScheduler::start_notify()
+{
+    db_platform::NotifySubscriber::Options options;
+    options.channel     = "job";
+    options.node        = node_;
+    options.application = "TaskScheduler";
+
+    notify_ = std::make_unique<db_platform::NotifySubscriber>(*pool_, *loop_, *logger_,
+        std::move(options),
+        [this](const NotifyRow& row) { on_row(row); });
+    ++notify_generation_;
+
+    notify_->start();
+}
+
+void TaskScheduler::stop_notify()
+{
+    if (!notify_)
+        return;
+
+    // The rows taken and not sent with a body go back; a body already sent ends
+    // as it would — complete() calls its handlers without the subscriber.
+    logger_->notice("TaskScheduler: the channel job is not in mode single; its subscriber is stopped");
+    notify_->stop("stopping: the channel job is not in mode single any more");
+    notify_.reset();
+}
+
+// ─── on_row ──────────────────────────────────────────────────────────────────
+//
+// A row taken: the job and its scope. api.job_claim makes it `executed` in a
+// transaction of its own and hands back the body — read there, under the gates
+// of the feed, never from the row.
+//
+
+void TaskScheduler::on_row(const NotifyRow& row)
+{
+    const auto payload = nlohmann::json::parse(row.payload, nullptr, /*allow_exceptions=*/false);
+
+    std::string id, scope;
+    if (payload.is_object()) {
+        if (auto it = payload.find("id"); it != payload.end() && it->is_string())
+            id = it->get<std::string>();
+        if (auto it = payload.find("scope"); it != payload.end() && it->is_string())
+            scope = it->get<std::string>();
+    }
+
+    if (id.empty() || !row.has_key) {
+        // Will not get better on another instance: confirmed, nothing run.
+        logger_->error("TaskScheduler: row {} of the channel job is not a job run: {}", row.id, row.payload);
+        notify_->complete(row, {});
+        return;
+    }
+
+    const auto it = scope_sessions_.find(scope);
+    if (it == scope_sessions_.end()) {
+        notify_->refuse(row, fmt::format("no session in scope {}", scope));
+        return;
+    }
+
+    const std::string session = it->second;
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.job_claim({}::uuid, {})",
+        pq_quote_literal(session), pq_quote_literal(id), pq_quote_literal(row.key));
+
+    pool_->execute(std::move(sql),
+        [this, row, generation = notify_generation_, session, id](std::vector<PgResult> results) {
+            on_claimed(row, generation, session, id, std::move(results));
+        },
+        {}, /*quiet=*/true);
+}
+
+void TaskScheduler::on_claimed(const NotifyRow& row, unsigned generation, const std::string& session,
+                               const std::string& id, std::vector<PgResult> results)
+{
+    // The subscriber that took the row is gone (stopped, its rows given back):
+    // a claim that committed leaves the job `executed`, and the poll or the
+    // next delivery settles it.
+    if (!notify_ || generation != notify_generation_)
+        return;
+
+    // results[0] = authorize, results[1] = the claim
+    if (!action_ok(results)) {
+        // Rolled back, or lost on the way: given out again (a claim that did
+        // commit is found `executed` by the next one and its body handed out).
+        notify_->refuse(row, fmt::format("claim failed: {}", result_error(results)));
+        return;
+    }
+
+    const auto& r = results[1];
+
+    if (r.rows() == 0) {
+        // Not to be run: gone, moved on, not due, canceled (aborted by the claim).
+        notify_->complete(row, {});
+        return;
+    }
+
+    if (const auto it = jobs_.find(id); it != jobs_.end()) {
+        if (it->second.row_token == 0) {
+            // Running here by the path `legacy` — a tick before the channel became
+            // `single`. Its own `done` settles the job; a second body is the fault
+            // the switch must not cause.
+            logger_->warn("TaskScheduler: job {} is offered while its body runs here; not run twice", id);
+            notify_->complete(row, {});
+            return;
+        }
+
+        // An earlier delivery of this row, still here: its lease ran out before
+        // its body got a connection. Its ack is refused under the old token and
+        // rolls its body back — this one is the run.
+        logger_->warn("TaskScheduler: job {} is handed out again (row {}, attempt {}) while its earlier run is "
+                      "still here; that one will be rolled back", id, row.id, row.attempts);
+    }
+
+    const int col_typecode = r.column_index("typecode");
+    const int col_body     = r.column_index("body");
+
+    if (col_typecode < 0 || col_body < 0) {
+        notify_->refuse(row, "claim answered without typecode or body");
+        return;
+    }
+
+    run_body(row, session, id, text_at(r, 0, col_typecode), text_at(r, 0, col_body));
+}
+
+// ─── run_body ────────────────────────────────────────────────────────────────
+//
+// One transaction:
+//   1. the limits below the lease
+//   2. api.authorize(session)
+//   3. <body SQL>
+//   4. done (periodic) or complete (one-shot)
+//   5. notify.ack — appended by NotifySubscriber
+//
+// `done` before the ack (T1104, В2): the ack takes the row of the queue, `done`
+// takes the job, and api.job_due of another instance takes them the other way
+// round — ack first deadlocked against it two times out of two, done first never.
+// A stale token (NT409) on the ack rolls the body back with it.
+//
+
+void TaskScheduler::run_body(const NotifyRow& row, const std::string& session,
+                             const std::string& id, const std::string& type_code,
+                             const std::string& body)
+{
+    jobs_[id] = Job{id, type_code, session, std::chrono::system_clock::now(), 0, row.token};
+
+    logger_->debug("TaskScheduler: starting job {} (type={}, row {}, attempt {})",
+                   id, type_code, row.id, row.attempts);
+
+    // The body on lines of its own: a "-- comment" closing it would swallow what
+    // follows, and a body without a final ';' would run into it.
+    auto sql = fmt::format(
+        "{}"
+        "SELECT * FROM api.authorize({});\n"
+        "{}\n"
+        ";\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {})",
+        body_limits(),
+        pq_quote_literal(session),
+        body,
+        pq_quote_literal(id),
+        pq_quote_literal(type_code == "periodic.job" ? "done" : "complete"));
+
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
+    notify_->complete(row, std::move(sql),
+        [this, id, token = row.token](std::vector<PgResult> /*results*/) {
+            logger_->debug("TaskScheduler: job {} done", id);
+            delete_run(id, token);
+        },
+        [this, row, session, id](std::string_view error, bool stale) {
+            if (stale) {
+                // Rolled back: the row was given out again, and whoever holds it
+                // now runs the job.
+                logger_->warn("TaskScheduler: job {}: the row went to another executor, "
+                              "the body is rolled back", id);
+                delete_run(id, row.token);
+                return;
+            }
+            fail_body(row, session, id, std::string(error));
+        },
+        /*quiet=*/true);
+}
+
+// ─── fail_body ───────────────────────────────────────────────────────────────
+//
+// The body (or its `done`) failed and was rolled back: `fail` with the error as
+// the label, then notify.ack — a transaction of its own, the ack last for the
+// same reason as above. A stale token rolls the `fail` back: the run is then
+// somebody else's. Refused (the job was canceled meanwhile): the row goes back,
+// and the next claim aborts the job.
+//
+
+void TaskScheduler::fail_body(const NotifyRow& row, const std::string& session,
+                              const std::string& id, const std::string& error)
+{
+    logger_->error("TaskScheduler: job {} failed: {}", id, error);
+
+    auto sql = db_platform::NotifySubscriber::ack_sql(row, fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {});\n"
+        "SELECT * FROM api.set_object_label({}::uuid, {})",
+        pq_quote_literal(session),
+        pq_quote_literal(id), pq_quote_literal("fail"),
+        pq_quote_literal(id), pq_quote_literal(error)));
+
+    pool_->execute(std::move(sql),
+        [this, row, id](std::vector<PgResult> results) {
+            delete_run(id, row.token);
+
+            const auto bad = std::find_if(results.begin(), results.end(),
+                [](const PgResult& r) { return !r.ok(); });
+
+            if (bad == results.end())
+                return;
+
+            if (std::string_view(bad->sqlstate()) == "NT409") {
+                logger_->warn("TaskScheduler: job {}: the row went to another executor "
+                              "before the failure was recorded", id);
+                return;
+            }
+
+            logger_->error("TaskScheduler: cannot record failure of job {}: {}", id,
+                           bad->error_message());
+
+            // The row is no longer with the subscriber (complete() took it):
+            // given back here, or it would wait out its lease.
+            pool_->execute(fmt::format("SELECT notify.nack({}, {}, {})", row.id, row.token,
+                                       pq_quote_literal("fail refused: " + std::string(bad->error_message()))),
+                [this, id](std::vector<PgResult> nack) {
+                    if (nack.empty() || !nack.back().ok())
+                        logger_->warn("TaskScheduler: job {}: nack refused: {}", id, result_error(nack));
+                },
+                {}, /*quiet=*/false);
+        },
+        {}, /*quiet=*/true);
+}
+
+std::string TaskScheduler::body_limits() const
+{
+    if (lease_ <= milliseconds(0))
+        return {};
+
+    // Each statement below 8/10 of the lease — the error is the body's own
+    // ("canceling statement due to statement timeout"), the job fails. The whole
+    // transaction below 9/10 where the server has transaction_timeout (17 and
+    // later): a body of several statements is bounded too, at the cost of the
+    // connection — the server ends the session. The lease counts from the take,
+    // and the claim and the pool's queue come before the body: a body that starts
+    // late may outlive the lease all the same — its row is handed out again, and
+    // its ack, refused under the old token, rolls it back. Never '0': that is
+    // "no limit".
+    return fmt::format(
+        "SELECT set_config('statement_timeout', '{}', true);\n"
+        "SELECT set_config('transaction_timeout', '{}', true) FROM pg_settings WHERE name = 'transaction_timeout';\n",
+        std::max<std::int64_t>(1, lease_.count() * 8 / 10), std::max<std::int64_t>(1, lease_.count() * 9 / 10));
+}
+
 // ─── do_start ────────────────────────────────────────────────────────────────
 //
 // Transition: enabled/aborted/failed → executed
@@ -201,8 +624,10 @@ void TaskScheduler::do_run(const std::string& session, const std::string& id,
     }
 
     auto sql = fmt::format(
+        "{}"
         "SELECT * FROM api.authorize({});\n"
         "{}",
+        body_limits(),
         pq_quote_literal(session),
         body);
 
@@ -435,6 +860,12 @@ std::string TaskScheduler::result_error(const std::vector<PgResult>& results)
 void TaskScheduler::delete_job(const std::string& id)
 {
     jobs_.erase(id);
+}
+
+void TaskScheduler::delete_run(const std::string& id, std::int64_t row_token)
+{
+    if (const auto it = jobs_.find(id); it != jobs_.end() && it->second.row_token == row_token)
+        jobs_.erase(it);
 }
 
 std::string TaskScheduler::job_session(const std::string& id) const
