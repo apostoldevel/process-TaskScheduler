@@ -38,6 +38,27 @@ std::string text_at(const PgResult& r, int row, int col)
     return r.is_null(row, col) ? std::string() : std::string(r.value(row, col));
 }
 
+// The connection or the server went while the batch was in its hands: written
+// or not is unknown here (NotifySubscriber::Failure). Class 08 and 57P0x — the
+// server's own word on it, also through a pooler; "" — no answer at all. Any
+// other code is an error of the batch, and the batch is one transaction.
+bool outcome_unknown(std::string_view sqlstate)
+{
+    return sqlstate.empty() || sqlstate.starts_with("08") || sqlstate.starts_with("57P0");
+}
+
+// notify.hold takes the row of the queue under its token, first in the batch:
+// the locks go "row, then the job", the order of notify.sweep, which closes the
+// row and then calls JobAbandon on the job. `done` first and the ack last took
+// them the other way round and deadlocked with the sweep at the end of the
+// lease of the last delivery (T1163). The sweep and notify.take skip a row held
+// so: while the batch lives on the server its row is given to nobody, past its
+// lease too. A stale token is NT409 here, before anything is written.
+std::string hold_sql(const db_platform::NotifyRow& row)
+{
+    return fmt::format("SELECT notify.hold({}, {});\n", row.id, row.token);
+}
+
 } // namespace
 
 // ─── on_start ────────────────────────────────────────────────────────────────
@@ -422,10 +443,10 @@ void TaskScheduler::on_claimed(const NotifyRow& row, unsigned generation, const 
         }
 
         // An earlier delivery of this row, still here: its lease ran out before
-        // its body got a connection. Its ack is refused under the old token and
-        // rolls its body back — this one is the run.
+        // its body got a connection. Its hold is refused under the old token
+        // before its body runs — this one is the run.
         logger_->warn("TaskScheduler: job {} is handed out again (row {}, attempt {}) while its earlier run is "
-                      "still here; that one will be rolled back", id, row.id, row.attempts);
+                      "still here; that one is stopped by its hold", id, row.id, row.attempts);
     }
 
     const int col_typecode = r.column_index("typecode");
@@ -443,15 +464,23 @@ void TaskScheduler::on_claimed(const NotifyRow& row, unsigned generation, const 
 //
 // One transaction:
 //   1. the limits below the lease
-//   2. api.authorize(session)
-//   3. <body SQL>
-//   4. done (periodic) or complete (one-shot)
-//   5. notify.ack — appended by NotifySubscriber
+//   2. notify.hold — the row of the queue, before the job (hold_sql)
+//   3. api.authorize(session)
+//   4. <body SQL>
+//   5. done (periodic) or complete (one-shot)
+//   6. notify.ack — appended by NotifySubscriber
 //
-// `done` before the ack (T1104, В2): the ack takes the row of the queue, `done`
-// takes the job, and api.job_due of another instance takes them the other way
-// round — ack first deadlocked against it two times out of two, done first never.
-// A stale token (NT409) on the ack rolls the body back with it.
+// The ack stays last, after `done` (T1104, В2): the ack first deadlocked with
+// api.job_due of another instance two times out of two. The hold first does not
+// (measured, T1163: 2 of 2 against api.job_due, and the sweep at the end of the
+// lease passes the held row by). The limits are set_config and lock nothing;
+// ahead of the hold they bound its wait too. A stale token (NT409) on the hold
+// stops the batch before the body runs.
+//
+// The connection lost with the batch (T1161): the outcome is the database's —
+// give_back(), not fail_body(), which would close the row of a body that may
+// never have run. A loss past the transaction limit is transaction_timeout,
+// the body's own: fail_body(), as an error of the body.
 //
 
 void TaskScheduler::run_body(const NotifyRow& row, const std::string& session,
@@ -467,15 +496,27 @@ void TaskScheduler::run_body(const NotifyRow& row, const std::string& session,
     // follows, and a body without a final ';' would run into it.
     auto sql = fmt::format(
         "{}"
+        "{}"
         "SELECT * FROM api.authorize({});\n"
         "{}\n"
         ";\n"
         "SELECT * FROM api.execute_object_action({}::uuid, {})",
         body_limits(),
+        hold_sql(row),
         pq_quote_literal(session),
         body,
         pq_quote_literal(id),
         pq_quote_literal(type_code == "periodic.job" ? "done" : "complete"));
+
+    // transaction_timeout ends the session, and the pool tells that as a lost
+    // connection with no SQLSTATE, like a failover (measured on 18, T1161). The
+    // server ends it no sooner than the limit after the batch began, and the
+    // batch begins no sooner than it is sent from here: a loss sooner than that
+    // is not the timeout. Later, it is taken for the body's own — `fail`, as
+    // before T1161; so is a failover that late (the pool's queue counts in), and
+    // any late loss on a server without transaction_timeout.
+    const auto limit = transaction_limit();
+    const auto sent  = std::chrono::steady_clock::now();
 
     // quiet: the statement carries a session code. PgPool prints statement
     // text at debug into postgres.log — inside the container, readable
@@ -485,27 +526,35 @@ void TaskScheduler::run_body(const NotifyRow& row, const std::string& session,
             logger_->debug("TaskScheduler: job {} done", id);
             delete_run(id, token);
         },
-        [this, row, session, id](std::string_view error, bool stale) {
+        [this, row, session, id, limit, sent](const db_platform::NotifySubscriber::Failure& failure, bool stale) {
             if (stale) {
-                // Rolled back: the row was given out again, and whoever holds it
-                // now runs the job.
-                logger_->warn("TaskScheduler: job {}: the row went to another executor, "
-                              "the body is rolled back", id);
+                // Refused by the hold, before the body: the row was given out
+                // again (whoever holds it now runs the job) or closed by the
+                // sweep. Or it was no longer with the subscriber, and nothing
+                // was sent.
+                logger_->warn("TaskScheduler: job {}: the row is no longer under this token "
+                              "(given out again or closed); the body did not run", id);
                 delete_run(id, row.token);
                 return;
             }
-            fail_body(row, session, id, std::string(error));
+            const bool timed_out = limit > milliseconds(0) && std::chrono::steady_clock::now() - sent >= limit;
+            if (outcome_unknown(failure.sqlstate) && !timed_out) {
+                give_back(row, id, failure.error);
+                return;
+            }
+            fail_body(row, session, id, failure.error);
         },
         /*quiet=*/true);
 }
 
 // ─── fail_body ───────────────────────────────────────────────────────────────
 //
-// The body (or its `done`) failed and was rolled back: `fail` with the error as
-// the label, then notify.ack — a transaction of its own, the ack last for the
-// same reason as above. A stale token rolls the `fail` back: the run is then
-// somebody else's. Refused (the job was canceled meanwhile): the row goes back,
-// and the next claim aborts the job.
+// The body (or its `done`) failed and was rolled back: notify.hold, `fail` with
+// the error as the label, then notify.ack — a transaction of its own, the hold
+// first and the ack last for the same reasons as above. A stale token stops the
+// `fail` at the hold: the run is then somebody else's. Refused (the job was
+// canceled meanwhile, or the connection went): the row goes back, and the next
+// claim aborts the job or hands its body out again.
 //
 
 void TaskScheduler::fail_body(const NotifyRow& row, const std::string& session,
@@ -514,9 +563,11 @@ void TaskScheduler::fail_body(const NotifyRow& row, const std::string& session,
     logger_->error("TaskScheduler: job {} failed: {}", id, error);
 
     auto sql = db_platform::NotifySubscriber::ack_sql(row, fmt::format(
+        "{}"
         "SELECT * FROM api.authorize({});\n"
         "SELECT * FROM api.execute_object_action({}::uuid, {});\n"
         "SELECT * FROM api.set_object_label({}::uuid, {})",
+        hold_sql(row),
         pq_quote_literal(session),
         pq_quote_literal(id), pq_quote_literal("fail"),
         pq_quote_literal(id), pq_quote_literal(error)));
@@ -553,6 +604,42 @@ void TaskScheduler::fail_body(const NotifyRow& row, const std::string& session,
         {}, /*quiet=*/true);
 }
 
+// ─── give_back ───────────────────────────────────────────────────────────────
+//
+// The connection went with the batch of the body (failover, a cut network,
+// pg_terminate_backend): committed or rolled back is unknown here, and known
+// to the database (T1161). notify.nack under the token asks it. The hold at the
+// head of the batch keeps the row locked while its transaction lives on the
+// server, so the nack waits for it to end: rolled back — the row goes out again
+// by the channel's repeat, and the next claim finds the job `executed` and
+// hands its body out; committed — the ack has closed the row, and the nack is
+// refused as NT409. `fail` here closed the row of a body that may never have
+// run: a periodic job lost its period, a one-shot one ended `disabled`. The
+// nack lost as well: the row returns by its lease.
+//
+
+void TaskScheduler::give_back(const NotifyRow& row, const std::string& id, const std::string& error)
+{
+    logger_->warn("TaskScheduler: job {}: the connection went with its body, the row is given back: {}", id, error);
+
+    delete_run(id, row.token);
+
+    pool_->execute(fmt::format("SELECT notify.nack({}, {}, {})", row.id, row.token,
+                               pq_quote_literal("outcome unknown: " + error)),
+        [this, id](std::vector<PgResult> results) {
+            if (!results.empty() && results.back().ok())
+                return;
+            if (!results.empty() && std::string_view(results.back().sqlstate()) == "NT409") {
+                logger_->info("TaskScheduler: job {}: the row is closed or with another executor — "
+                              "the body was committed, or its lease ran out", id);
+                return;
+            }
+            logger_->warn("TaskScheduler: job {}: nack refused, the row returns by its lease: {}", id,
+                          result_error(results));
+        },
+        {}, /*quiet=*/false);
+}
+
 std::string TaskScheduler::body_limits() const
 {
     if (lease_ <= milliseconds(0))
@@ -563,14 +650,22 @@ std::string TaskScheduler::body_limits() const
     // transaction below 9/10 where the server has transaction_timeout (17 and
     // later): a body of several statements is bounded too, at the cost of the
     // connection — the server ends the session. The lease counts from the take,
-    // and the claim and the pool's queue come before the body: a body that starts
-    // late may outlive the lease all the same — its row is handed out again, and
-    // its ack, refused under the old token, rolls it back. Never '0': that is
+    // and the claim and the pool's queue come before the body: a batch that
+    // reaches the server after the lease may find its row handed out again — its
+    // hold is refused under the old token, and the body does not run. Once held,
+    // the row is given to nobody until the batch ends. Never '0': that is
     // "no limit".
     return fmt::format(
         "SELECT set_config('statement_timeout', '{}', true);\n"
         "SELECT set_config('transaction_timeout', '{}', true) FROM pg_settings WHERE name = 'transaction_timeout';\n",
-        std::max<std::int64_t>(1, lease_.count() * 8 / 10), std::max<std::int64_t>(1, lease_.count() * 9 / 10));
+        std::max<std::int64_t>(1, lease_.count() * 8 / 10), transaction_limit().count());
+}
+
+TaskScheduler::milliseconds TaskScheduler::transaction_limit() const
+{
+    if (lease_ <= milliseconds(0))
+        return milliseconds(0);
+    return milliseconds(std::max<std::int64_t>(1, lease_.count() * 9 / 10));
 }
 
 // ─── do_start ────────────────────────────────────────────────────────────────

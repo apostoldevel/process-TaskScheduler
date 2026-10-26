@@ -57,21 +57,27 @@ class Logger;
 //   - api.job_due() in every scope: the due jobs become rows of the channel
 //   - NotifySubscriber takes a row → api.job_claim: `execute`, its own
 //     committed transaction, and the body (read there, never from the row)
-//   - the body, then `done` / `complete`, then notify.ack — one transaction.
-//     `done` before the ack: the other order deadlocks with another
-//     instance's api.job_due (measured, T1104). A stale token (NT409) on the
-//     ack rolls the body back with it.
-//   - a body that fails: `fail` + label, then notify.ack — a transaction of
-//     its own.
+//   - notify.hold, the body, then `done` / `complete`, then notify.ack — one
+//     transaction. The hold takes the row first, the order of notify.sweep
+//     (T1163); the ack last: first, it deadlocks with another instance's
+//     api.job_due (measured, T1104). A stale token (NT409) on the hold stops
+//     the batch before the body.
+//   - a body that fails: notify.hold, `fail` + label, then notify.ack — a
+//     transaction of its own.
+//   - the connection lost with the batch: no `fail` — notify.nack, and the
+//     database, which knows whether it committed, gives the row out again or
+//     refuses (T1161). Lost past the transaction limit — transaction_timeout,
+//     told by the pool as a loss too: `fail`, as a body's error.
 //   - the body is bounded below the channel's lease (statement_timeout, and
-//     transaction_timeout where the server has it): a body outliving the lease
-//     is handed out again and would run twice.
+//     transaction_timeout where the server has it). A held row is given to
+//     nobody while its batch lives; a batch that comes after its lease and
+//     finds the row handed out again is stopped by the hold.
 //   - a job canceled while its body runs is not interrupted: its `done` is
 //     refused, the body is rolled back with it, the row goes back and
 //     api.job_claim aborts the job.
 //   - a row handed out again while this process still runs its earlier
 //     delivery (the lease ran out in the pool's queue) is run: the earlier
-//     ack is refused under the old token and its body rolled back.
+//     hold is refused under the old token and its body does not run.
 //   - the guarantees above hold for a body that does not COMMIT itself: one
 //     that does splits the batch, and what it committed stays.
 //   - the channel read in any mode but `single` again: the subscriber is
@@ -166,8 +172,12 @@ private:
                   const std::string& type_code, const std::string& body);
     void fail_body(const NotifyRow& row, const std::string& session, const std::string& id,
                    const std::string& error);
+    /// The connection went with the body: the row back to the database, which knows the outcome.
+    void give_back(const NotifyRow& row, const std::string& id, const std::string& error);
     /// The statements that bound the body below the lease; empty without one.
     std::string body_limits() const;
+    /// The bound of the whole transaction of a body (transaction_timeout); zero — none.
+    milliseconds transaction_limit() const;
 
     void do_start(const std::string& session, const std::string& id,
                   const std::string& type_code, const std::string& body);
